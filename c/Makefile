@@ -106,11 +106,6 @@ EXE     =
 endif
 endif
 
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tok$(EXE) tests/test_qwen_units$(EXE) tests/test_qwen_tiny$(EXE) tests/test_qwen_deltanet$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_kv_alloc$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE)
-ifneq (,$(LINUX))
-TEST_BINS += tests/test_uring$(EXE)
-endif
-
 all: glm$(EXE) olmoe$(EXE) qwen$(EXE)
 
 # phony aliases → '<name>.exe' on Windows (so 'make glm' works on every platform)
@@ -145,54 +140,6 @@ endif
 portable:
 	$(MAKE) all ARCH=$(PORTABLE_ARCH)
 
-tests/test_json$(EXE): tests/test_json.c json.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-tests/test_st$(EXE): tests/test_st.c st.h json.h compat.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-tests/test_tok$(EXE): tests/test_tok.c tok.h tok_unicode.h json.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-tests/test_qwen_units$(EXE): tests/test_qwen_units.c qwen.c st.h json.h tok.h tok_unicode.h compat.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-tests/test_qwen_tiny$(EXE): tests/test_qwen_tiny.c qwen.c st.h json.h tok.h tok_unicode.h compat.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-tests/test_qwen_deltanet$(EXE): tests/test_qwen_deltanet.c tests/deltanet_fixture.h qwen.c st.h json.h tok.h tok_unicode.h compat.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-tests/test_tier$(EXE): tests/test_tier.c tier.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-tests/test_grammar$(EXE): tests/test_grammar.c grammar.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-tests/test_schema_gbnf$(EXE): tests/test_schema_gbnf.c schema_gbnf.h grammar.h json.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-tests/test_idot$(EXE): tests/test_idot.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-tests/test_compat_direct$(EXE): tests/test_compat_direct.c compat.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-tests/test_uring$(EXE): tests/test_uring.c glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
-test-c: $(TEST_BINS)
-	@set -e; for t in $(TEST_BINS); do echo "== $$t"; ./$$t; done
-
 # GoogleTest suite: separate CMake build path (engines stay on plain make).
 # First configure downloads a pinned gtest via FetchContent unless a system
 # GTest is found.
@@ -209,6 +156,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f glm glm.exe olmoe olmoe.exe qwen qwen.exe $(TEST_BINS) tests/test_uring tests/test_uring.exe
+	rm -f glm glm.exe olmoe olmoe.exe qwen qwen.exe gemma gemma.exe
+	rm -rf $(TESTS_BUILD)
 
-.PHONY: all glm olmoe qwen portable test-c test check clean
+.PHONY: all glm olmoe qwen portable test check clean

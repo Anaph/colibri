@@ -18,11 +18,16 @@ Three standalone engines, one per architecture:
 make            # builds all engines (from repo root or c/)
 make glm        # just one engine
 make portable   # portable CPU baseline (x86-64-v3 / armv8-a / power8)
-make test       # C unit tests
+make test       # test suite (GoogleTest via a separate CMake build path)
 ```
 
 Requirements: a C compiler (gcc/clang) and GNU make. Linux, macOS, Windows
 (MinGW/MSYS2), *BSD and PowerPC are supported. OpenMP is used when available.
+
+The engines build with the C compiler alone. `make test` additionally needs
+cmake ≥ 3.24 and a C++ compiler for the GoogleTest harness (test logic itself
+is plain C; the C++ is confined to thin gtest glue). The first configure
+downloads a pinned gtest via FetchContent unless a system GTest is installed.
 
 ## Run
 
@@ -73,15 +78,34 @@ In chat mode the recurrent DeltaNet state is append-only: editing history
 requires a full conversation reset (the engine does this automatically when
 the context fills up).
 
-### Validating against transformers
+### Validating against a reference (REF mode)
 
-Token-parity validation needs a reference run from a machine with network
-access and `transformers` installed:
+`REF=<file> SNAP=<snapshot> ./c/qwen` greedy-decodes and compares token ids
+against a reference file, printing the match count (exit 0 on full match,
+2 otherwise). The file format is plain JSON:
 
+```json
+{"prompt_ids": [151644, 872, ...], "full_ids": [151644, 872, ..., 785, 6722]}
 ```
-python3 c/tests/make_ref.py Qwen/Qwen3-0.6B "The capital of France is" 24 > ref_qwen.json
-REF=ref_qwen.json SNAP=/path/to/Qwen3-0.6B ./c/qwen     # expects full token match at f32
+
+`full_ids` must extend `prompt_ids`; the engine generates
+`len(full_ids) - len(prompt_ids)` tokens greedily from `prompt_ids` and
+requires an exact id-by-id match (f32 build). Produce the reference with any
+tool that runs the original model — e.g. with `transformers`:
+
+```python
+tok = AutoTokenizer.from_pretrained(m); model = AutoModelForCausalLM.from_pretrained(m, torch_dtype=torch.float32)
+ids = tok(prompt, return_tensors="pt").input_ids
+out = model.generate(ids, max_new_tokens=24, do_sample=False, num_beams=1)
+json.dump({"prompt_ids": ids[0].tolist(), "full_ids": out[0].tolist()}, open("ref.json","w"))
 ```
+
+### Tokenizer parity (tok_oracle)
+
+The test build also produces `c/tests/build/tok_oracle` — a corpus-scale
+parity harness: `./tok_oracle <tokenizer.json> < cases.tsv` where each line
+is `TEXT\tID,ID,...` (escapes: `\n \t \r \\`). Run it against ids produced
+by the reference tokenizer before debugging model-level mismatches.
 
 ## Layout
 

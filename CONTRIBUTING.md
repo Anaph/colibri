@@ -24,8 +24,10 @@ make check
 `make -C c check` remains available for scripts that already run from the
 engine directory.
 
-This performs one portable CPU build and the C unit tests. It does not download
-a model.
+This performs one portable CPU build and the test suite. It does not download
+a model. The test suite needs cmake ≥ 3.24 and a C++ compiler (GoogleTest glue
+only — all test logic is C); the first configure fetches a pinned gtest over
+the network unless a system GTest is installed.
 
 Benchmark reports should include the commit, exact commands, hardware and
 storage details, warm-up policy, run count, and median throughput.
