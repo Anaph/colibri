@@ -12,10 +12,8 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
-#include <sys/resource.h>
-#endif
 #include "st.h"
+#include "nn.h"
 
 /* ---------- config ---------- */
 typedef struct {
@@ -48,113 +46,6 @@ typedef struct {
     float **K, **V; int kv_len, max_t;
     double dense_load_s;
 } Model;
-
-/* ---------- utility ---------- */
-static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
-#if defined(__APPLE__)
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0*1024.0); }  /* macOS: byte */
-#else
-static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }        /* Linux: KB */
-#endif
-static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
-
-/* y[S,O] = x[S,I] @ W^T,  W e' [O,I] row-major */
-static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const float *w = W + (int64_t)o * I;
-        for (int s = 0; s < S; s++) {
-            const float *xs = x + (int64_t)s * I;
-            float acc = 0.f;
-            for (int i = 0; i < I; i++) acc += xs[i] * w[i];
-            y[(int64_t)s * O + o] = acc;
-        }
-    }
-}
-
-/* y[1,O] = x[1,I] @ W^T con W quantizzato: q[O,I] int8 + scala per riga.
- * W[o,i] ~= q[o,i]*scale[o]  ->  y[o] = scale[o] * sum_i x[i]*q[o,i].
- * Su ARM: attivazione quantizzata Q8_0 (scala per blocco di 16) + dot int8
- * NEON (sdot dove c'e' dotprod) — stessa famiglia IDOT di glm.c, IDOT=0 per
- * la via scalare byte-esatta. Misurato 2.7x end-to-end su M5. */
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
-    int32x4_t acc = vdupq_n_s32(0);
-    int8x16_t va = vld1q_s8(a), vb = vld1q_s8(b);
-#if defined(__ARM_FEATURE_DOTPROD)
-    acc = vdotq_s32(acc, va, vb);
-#else
-    acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(va),  vget_low_s8(vb)));
-    acc = vpadalq_s16(acc, vmull_s8(vget_high_s8(va), vget_high_s8(vb)));
-#endif
-    return vaddvq_s32(acc);
-}
-#endif
-static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
-#if defined(__ARM_NEON)
-    static int idot = -1;
-    if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
-    if (idot && I % 16 == 0 && I <= 4096) {
-        int nb = I / 16; int8_t xi[4096]; float xs[256];
-        for (int b = 0; b < nb; b++) {
-            const float *xb = x + b*16;
-            float am = 0.f; for (int i = 0; i < 16; i++) { float a = fabsf(xb[i]); if (a > am) am = a; }
-            float s = am/127.f; if (s < 1e-12f) s = 1e-12f;
-            xs[b] = s; float inv = 1.f/s;
-            for (int i = 0; i < 16; i++) xi[b*16+i] = (int8_t)lrintf(xb[i]*inv);
-        }
-        #pragma omp parallel for schedule(static)
-        for (int o = 0; o < O; o++) {
-            const int8_t *w = q + (int64_t)o * I;
-            float acc = 0.f;
-            for (int b = 0; b < nb; b++) acc += xs[b]*(float)dot_i8_16(xi+b*16, w+b*16);
-            y[o] = acc * scale[o];
-        }
-        return;
-    }
-#endif
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const int8_t *w = q + (int64_t)o * I;
-        float acc = 0.f;
-        for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
-        y[o] = acc * scale[o];
-    }
-}
-
-/* quantizza un weight f32 [O,I] -> int8 q[O,I] + scala[O], simmetrica per riga.
- * Replica quant_dequant() del Python: scale = amax(|w|, riga)/qmax, q = round(w/scale). */
-static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I, int bits) {
-    int qmax = (1 << (bits - 1)) - 1;     /* 8->127, 4->7, 2->1 */
-    #pragma omp parallel for schedule(static)
-    for (int o = 0; o < O; o++) {
-        const float *wr = w + (int64_t)o * I;
-        float amax = 0.f; for (int i = 0; i < I; i++) { float a = fabsf(wr[i]); if (a > amax) amax = a; }
-        float s = amax / qmax; if (s < 1e-8f) s = 1e-8f;
-        scale[o] = s;
-        int8_t *qr = q + (int64_t)o * I;
-        for (int i = 0; i < I; i++) {
-            int v = (int)lrintf(wr[i] / s);
-            if (v >  qmax) v =  qmax;
-            if (v < -qmax-1) v = -qmax-1;
-            qr[i] = (int8_t)v;
-        }
-    }
-}
-
-/* rmsnorm su una riga di lunghezza D, in-place su out (out puo' essere == x) */
-static void rmsnorm_row(float *out, const float *x, const float *w, int D, float eps) {
-    double ms = 0; for (int i = 0; i < D; i++) ms += (double)x[i]*x[i];
-    float r = 1.f / sqrtf((float)(ms / D) + eps);
-    for (int i = 0; i < D; i++) out[i] = x[i] * r * w[i];
-}
-
-static void softmax_row(float *x, int n) {
-    float m = -1e30f; for (int i = 0; i < n; i++) if (x[i] > m) m = x[i];
-    float s = 0; for (int i = 0; i < n; i++) { x[i] = expf(x[i]-m); s += x[i]; }
-    for (int i = 0; i < n; i++) x[i] /= s;
-}
 
 /* ---------- caricamento ---------- */
 static void load_cfg(Cfg *c, const char *snap) {
@@ -290,28 +181,31 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     int Tk = pos_base + S;             /* numero di key totali disponibili */
     float scale = 1.f / sqrtf((float)hd);
     float *ctx = falloc((int64_t)S*D);
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int hh = 0; hh < H; hh++) {
-        for (int s = 0; s < S; s++) {
-            int qpos = pos_base + s;
-            const float *qv = q + (int64_t)s*D + hh*hd;
-            float sc[4096];
-            for (int t = 0; t <= qpos; t++) {          /* causale: t <= qpos */
-                const float *kv = m->K[layer] + ((int64_t)hh*m->max_t + t)*hd;
-                float acc = 0; for (int dd = 0; dd < hd; dd++) acc += qv[dd]*kv[dd];
-                sc[t] = acc * scale;
-            }
-            softmax_row(sc, qpos+1);
-            float *cx = ctx + (int64_t)s*D + hh*hd;
-            for (int dd = 0; dd < hd; dd++) cx[dd] = 0;
-            for (int t = 0; t <= qpos; t++) {
-                const float *vrow = m->V[layer] + ((int64_t)hh*m->max_t + t)*hd;
-                float a = sc[t];
-                for (int dd = 0; dd < hd; dd++) cx[dd] += a * vrow[dd];
+    #pragma omp parallel
+    {
+        float *sc = falloc(Tk);        /* punteggi per thread, dimensionati sulle key reali */
+        #pragma omp for collapse(2) schedule(static)
+        for (int hh = 0; hh < H; hh++) {
+            for (int s = 0; s < S; s++) {
+                int qpos = pos_base + s;
+                const float *qv = q + (int64_t)s*D + hh*hd;
+                for (int t = 0; t <= qpos; t++) {          /* causale: t <= qpos */
+                    const float *kv = m->K[layer] + ((int64_t)hh*m->max_t + t)*hd;
+                    float acc = 0; for (int dd = 0; dd < hd; dd++) acc += qv[dd]*kv[dd];
+                    sc[t] = acc * scale;
+                }
+                softmax_row(sc, qpos+1);
+                float *cx = ctx + (int64_t)s*D + hh*hd;
+                for (int dd = 0; dd < hd; dd++) cx[dd] = 0;
+                for (int t = 0; t <= qpos; t++) {
+                    const float *vrow = m->V[layer] + ((int64_t)hh*m->max_t + t)*hd;
+                    float a = sc[t];
+                    for (int dd = 0; dd < hd; dd++) cx[dd] += a * vrow[dd];
+                }
             }
         }
+        free(sc);
     }
-    (void)Tk;
     matmul(out, ctx, l->o, S, D, D);
     free(q); free(k); free(vv); free(ctx);
 }

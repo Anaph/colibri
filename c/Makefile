@@ -117,7 +117,7 @@ gemma: gemma$(EXE)
 glm$(EXE): glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h
 	$(CC) $(CFLAGS) glm.c -o glm$(EXE) $(LDFLAGS)
 
-olmoe$(EXE): olmoe.c st.h json.h compat.h
+olmoe$(EXE): olmoe.c nn.h st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
 
 qwen$(EXE): qwen.c nn.h runtime.h st.h json.h tok.h tok_unicode.h compat.h
