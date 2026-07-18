@@ -7,6 +7,8 @@ int ht_json(void);
 int ht_st(void);
 int ht_tok_pairs(void);
 int ht_tok_strings(void);
+int ht_tok_sp(void);
+int ht_tok_sp_detect(void);
 int ht_tier(void);
 int ht_grammar(void);
 int ht_schema_gbnf(void);
@@ -22,6 +24,8 @@ C_TEST(Json,        Parse,          ht_json)
 C_TEST(Safetensors, Primitives,     ht_st)
 C_TEST(Tok,         MergesPairs,    ht_tok_pairs)
 C_TEST(Tok,         MergesStrings,  ht_tok_strings)
+C_TEST(Tok,         SentencePiece,  ht_tok_sp)
+C_TEST(Tok,         SpDetection,    ht_tok_sp_detect)
 C_TEST(Tier,        SwapDecayLfru,  ht_tier)
 C_TEST(Grammar,     Pda,            ht_grammar)
 C_TEST(SchemaGbnf,  Compile,        ht_schema_gbnf)

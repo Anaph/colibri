@@ -45,6 +45,13 @@ typedef struct {
     Special *sp; int nsp;                       /* added tokens, ordinati per lunghezza decrescente */
     uint32_t byte2cp[256]; int byte2cp_len[256]; char byte2str[256][3];
     int16_t cp2byte[1024];
+    /* modalita' SentencePiece (Gemma & co.): BPE su stringhe LETTERALI con
+     * metaspazio U+2581 al posto degli spazi e byte-fallback <0xXX>.
+     * Rilevata da model.byte_fallback==true nel tokenizer.json. */
+    int mode;                 /* 0 = byte-level (GPT-2/cl100k), 1 = sentencepiece */
+    int add_dummy_prefix;     /* normalizer Prepend "▁": prefissa il testo */
+    int byte_tok[256];        /* id di "<0xXX>" oppure -1 */
+    int16_t *id2byte;         /* [n_ids] inverso di byte_tok (-1 = non byte-token) */
 } Tok;
 
 /* ---------- UTF-8 ---------- */
@@ -98,6 +105,24 @@ static void tok_load(Tok *T, const char *path){
     jval *merges=json_get(model,"merges");
     jval *added=json_get(root,"added_tokens");
     if(!vocab||!merges){ fprintf(stderr,"tokenizer.json: missing model.vocab/merges\n"); exit(1); }
+    /* modalita': byte_fallback=true e' la firma SentencePiece (assente/false su
+     * GLM/Qwen byte-level) */
+    jval *bf=json_get(model,"byte_fallback");
+    T->mode = (bf && bf->t==J_BOOL && bf->boolean) ? 1 : 0;
+    /* add_dummy_prefix: nodo Prepend nel normalizer (diretto o in Sequence) */
+    T->add_dummy_prefix = 0;
+    jval *nrm=json_get(root,"normalizer");
+    if(nrm && nrm->t==J_OBJ){
+        jval *nt=json_get(nrm,"type");
+        if(nt && nt->t==J_STR && !strcmp(nt->str,"Prepend")) T->add_dummy_prefix=1;
+        jval *seq=json_get(nrm,"normalizers");
+        if(seq && seq->t==J_ARR)
+            for(int i=0;i<seq->len;i++){
+                jval *st_=json_get(seq->kids[i],"type");
+                if(st_ && st_->t==J_STR && !strcmp(st_->str,"Prepend")) T->add_dummy_prefix=1;
+            }
+    }
+    if(T->mode) fprintf(stderr,"[tok] modalita' sentencepiece (byte_fallback), dummy_prefix=%d\n",T->add_dummy_prefix);
 
     /* id massimo per dimensionare id2str */
     int maxid=0;
@@ -147,21 +172,25 @@ static void tok_load(Tok *T, const char *path){
         }
         qsort(T->sp,T->nsp,sizeof(Special),cmp_sp_len);   /* match piu' lungo per primo */
     }
+    /* tabella byte-fallback <0xXX> (solo modalita' sp; -1 se il vocab non li ha) */
+    T->id2byte=malloc(T->n_ids*sizeof(int16_t));
+    for(int i=0;i<T->n_ids;i++) T->id2byte[i]=-1;
+    for(int b=0;b<256;b++){
+        char nm[8]; int nl=snprintf(nm,sizeof(nm),"<0x%02X>",b);
+        T->byte_tok[b]=hm_get(&T->vocab,nm,nl);
+        if(T->byte_tok[b]>=0) T->id2byte[T->byte_tok[b]]=(int16_t)b;
+    }
     /* arena/buf restano allocati: le stringhe (j_dup) sono malloc indipendenti e ci servono vive */
     (void)arena;
 }
 
-/* ---------- BPE su un pezzo: byte grezzi [a,b) -> id appesi a out ---------- */
-static void bpe_piece(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
-    int nb=b-a;
-    /* stringa byte-level (concatenazione di byte2str): <=2 byte per byte di input */
-    char *s=malloc(2*nb+1); int sl=0;
-    for(int i=a;i<b;i++){ int bb=p[i]; memcpy(s+sl,T->byte2str[bb],T->byte2cp_len[bb]); sl+=T->byte2cp_len[bb]; }
-    s[sl]=0;
+/* ---------- nucleo BPE: merge greedy per rank su una stringa di simboli.
+ * sp_fallback=0 (byte-level): simboli fuori vocab vengono scartati.
+ * sp_fallback=1 (sentencepiece): ogni byte grezzo del simbolo -> <0xXX>. */
+static void bpe_core(Tok *T, const char *s, int sl, int *out, int *no, int max, int sp_fallback){
     /* ignore_merges: se l'intero pezzo e' un token, emettilo diretto */
     int whole=hm_get(&T->vocab,s,sl);
-    if(whole>=0){ if(*no<max) out[(*no)++]=whole; free(s); return; }
-    /* simboli iniziali = codepoint della stringa byte-level */
+    if(whole>=0){ if(*no<max) out[(*no)++]=whole; return; }
     int *soff=malloc((sl+1)*sizeof(int)), *slen=malloc((sl+1)*sizeof(int)); int ns=0;
     for(int i=0;i<sl;){ uint32_t cp; int k=u8_next((const unsigned char*)s,sl,i,&cp);
         soff[ns]=i; slen[ns]=k; ns++; i+=k; }
@@ -181,9 +210,44 @@ static void bpe_piece(Tok *T, const unsigned char *p, int a, int b, int *out, in
     }
     for(int i=0;i<ns;i++){
         int id=hm_get(&T->vocab,s+soff[i],slen[i]);
-        if(id>=0 && *no<max) out[(*no)++]=id;
+        if(id>=0){ if(*no<max) out[(*no)++]=id; continue; }
+        if(sp_fallback){
+            for(int j=0;j<slen[i];j++){
+                unsigned char bb=(unsigned char)s[soff[i]+j];
+                if(T->byte_tok[bb]>=0){ if(*no<max) out[(*no)++]=T->byte_tok[bb]; }
+                else fprintf(stderr,"[tok] byte 0x%02X senza fallback nel vocab\n",bb);
+            }
+        }
     }
-    free(s); free(soff); free(slen); free(kbuf);
+    free(soff); free(slen); free(kbuf);
+}
+
+/* ---------- BPE byte-level su un pezzo: byte grezzi [a,b) -> id appesi a out ---------- */
+static void bpe_piece(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
+    int nb=b-a;
+    /* stringa byte-level (concatenazione di byte2str): <=2 byte per byte di input */
+    char *s=malloc(2*nb+1); int sl=0;
+    for(int i=a;i<b;i++){ int bb=p[i]; memcpy(s+sl,T->byte2str[bb],T->byte2cp_len[bb]); sl+=T->byte2cp_len[bb]; }
+    s[sl]=0;
+    bpe_core(T,s,sl,out,no,max,0);
+    free(s);
+}
+
+/* ---------- pezzo sentencepiece: [a,b) letterale, spazio -> U+2581 ----------
+ * is_start prefissa il metaspazio se il normalizer ha Prepend (add_dummy_prefix).
+ * BPE sull'INTERO pezzo (niente pre-split): corretto per ogni vocab SP, anche
+ * con token multi-parola; i pezzi sono comunque delimitati dagli added-token. */
+static void sp_piece(Tok *T, const unsigned char *p, int a, int b, int is_start, int *out, int *no, int max){
+    int nb=b-a;
+    char *s=malloc(3*(int64_t)nb+4); int sl=0;
+    if(is_start && T->add_dummy_prefix){ memcpy(s+sl,"\xE2\x96\x81",3); sl+=3; }
+    for(int i=a;i<b;i++){
+        if(p[i]==' '){ memcpy(s+sl,"\xE2\x96\x81",3); sl+=3; }
+        else s[sl++]=(char)p[i];
+    }
+    s[sl]=0;
+    bpe_core(T,s,sl,out,no,max,1);
+    free(s);
 }
 
 /* ---------- pre-tokenizer regex (pattern cl100k) su una porzione di testo ----------
@@ -257,7 +321,10 @@ static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
             }
         }
         int chunk_end = (hitpos<0) ? len : hitpos;
-        if(chunk_end>i) pretok_chunk(T,p,i,chunk_end,out,&no,max);
+        if(chunk_end>i){
+            if(T->mode==1) sp_piece(T,p,i,chunk_end,i==0,out,&no,max);
+            else pretok_chunk(T,p,i,chunk_end,out,&no,max);
+        }
         if(hitpos<0) break;
         if(no<max) out[no++]=hitid;
         i=hitpos+hitlen;
@@ -271,7 +338,7 @@ static int tok_id_of(Tok *T, const char *content){
     return -1;
 }
 
-/* ---------- decode: id -> testo (byte-level inverso; added token letterali) ---------- */
+/* ---------- decode: id -> testo (byte-level inverso oppure sp; added letterali) ---------- */
 static int tok_decode(Tok *T, const int *ids, int n, char *out, int max){
     int o=0;
     for(int i=0;i<n;i++){
@@ -279,6 +346,16 @@ static int tok_decode(Tok *T, const int *ids, int n, char *out, int max){
         const char *s=T->id2str[id];
         if(T->id_added[id]){ int l=(int)strlen(s); for(int j=0;j<l && o<max;j++) out[o++]=s[j]; continue; }
         int sl=(int)strlen(s);
+        if(T->mode==1){
+            if(T->id2byte && T->id2byte[id]>=0){ if(o<max) out[o++]=(char)(unsigned char)T->id2byte[id]; continue; }
+            /* letterale con metaspazio U+2581 -> spazio */
+            for(int j=0;j<sl;){
+                if(j+3<=sl && (unsigned char)s[j]==0xE2 && (unsigned char)s[j+1]==0x96 && (unsigned char)s[j+2]==0x81){
+                    if(o<max) out[o++]=' '; j+=3;
+                } else { if(o<max) out[o++]=s[j]; j++; }
+            }
+            continue;
+        }
         for(int j=0;j<sl;){ uint32_t c; int k=u8_next((const unsigned char*)s,sl,j,&c); j+=k;
             if(c<1024 && T->cp2byte[c]>=0 && o<max) out[o++]=(char)(unsigned char)T->cp2byte[c]; }
     }

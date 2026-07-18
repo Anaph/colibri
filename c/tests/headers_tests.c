@@ -94,6 +94,52 @@ static int tok_run_fixture(const char *name, const char *body) {
 int ht_tok_pairs(void)   { return tok_run_fixture("pairs",   TOK_FIX_PAIRS); }
 int ht_tok_strings(void) { return tok_run_fixture("strings", TOK_FIX_STRINGS); }
 
+/* ---- modalita' sentencepiece (Gemma): metaspazio + byte-fallback ---- */
+static const char *TOK_FIX_SP =
+  "{\"model\":{\"type\":\"BPE\",\"byte_fallback\":true,"
+  "\"vocab\":{\"h\":0,\"e\":1,\"l\":2,\"o\":3,\"\\u2581\":4,"
+  "\"he\":5,\"ll\":6,\"hell\":7,\"hello\":8,\"\\u2581hello\":9,"
+  "\"<0x41>\":10,\"<0x01>\":11},"
+  "\"merges\":[\"h e\",\"l l\",\"he ll\",\"hell o\",\"\\u2581 hello\"]},"
+  "\"added_tokens\":[{\"id\":12,\"content\":\"<eos>\"}]}";
+
+int ht_tok_sp(void) {
+    char path[512];
+    CHECK(tok_write_tmp("sp", TOK_FIX_SP, path, sizeof(path)) == 0);
+    Tok T; tok_load(&T, path);
+    CHECK(T.mode == 1);                          /* byte_fallback -> sp */
+    CHECK(T.add_dummy_prefix == 0);              /* niente Prepend nel fixture */
+    int ids[64];
+    int n = tok_encode(&T, "hello", 5, ids, 64);
+    CHECK(n == 1 && ids[0] == 8);
+    n = tok_encode(&T, "hello hello", 11, ids, 64);          /* spazio -> "▁hello" */
+    CHECK(n == 2 && ids[0] == 8 && ids[1] == 9);
+    n = tok_encode(&T, "hello\x01", 6, ids, 64);             /* byte-fallback <0x01> */
+    CHECK(n == 2 && ids[0] == 8 && ids[1] == 11);
+    n = tok_encode(&T, "hello<eos>hello", 15, ids, 64);      /* added atomico */
+    CHECK(n == 3 && ids[0] == 8 && ids[1] == 12 && ids[2] == 8);
+    /* round-trip: "hello hello" -> ids -> "hello hello" (▁->spazio) */
+    n = tok_encode(&T, "hello hello", 11, ids, 64);
+    char dec[64]; int dn = tok_decode(&T, ids, n, dec, 63);
+    CHECK(dn == 11 && !memcmp(dec, "hello hello", 11));
+    /* byte-fallback round-trip */
+    n = tok_encode(&T, "hello\x01", 6, ids, 64);
+    dn = tok_decode(&T, ids, n, dec, 63);
+    CHECK(dn == 6 && !memcmp(dec, "hello\x01", 6));
+    remove(path);
+    return 0;
+}
+
+int ht_tok_sp_detect(void) {
+    /* stesso vocab senza byte_fallback -> resta byte-level */
+    char path[512];
+    CHECK(tok_write_tmp("nosp", TOK_FIX_STRINGS, path, sizeof(path)) == 0);
+    Tok T; tok_load(&T, path);
+    CHECK(T.mode == 0);
+    remove(path);
+    return 0;
+}
+
 /* ---------------- tier.h ---------------- */
 int ht_tier(void) {
     uint32_t heat[6] = {20,2,8,3,30,1};
