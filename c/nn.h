@@ -14,6 +14,7 @@
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
 #endif
+#include "simd.h"
 
 /* peso denso: f32 oppure int8+scala per riga (QBITS=8) */
 typedef struct { float *f; int8_t *q; float *qs; int O, I; } Mat;
