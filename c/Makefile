@@ -106,22 +106,26 @@ EXE     =
 endif
 endif
 
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tok$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_kv_alloc$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tok$(EXE) tests/test_qwen_units$(EXE) tests/test_qwen_tiny$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_kv_alloc$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
 
-all: glm$(EXE) olmoe$(EXE)
+all: glm$(EXE) olmoe$(EXE) qwen$(EXE)
 
 # phony aliases → '<name>.exe' on Windows (so 'make glm' works on every platform)
 glm: glm$(EXE)
 olmoe: olmoe$(EXE)
+qwen: qwen$(EXE)
 
 glm$(EXE): glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h
 	$(CC) $(CFLAGS) glm.c -o glm$(EXE) $(LDFLAGS)
 
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
+
+qwen$(EXE): qwen.c st.h json.h tok.h tok_unicode.h compat.h
+	$(CC) $(CFLAGS) qwen.c -o qwen$(EXE) $(LDFLAGS)
 
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
@@ -148,6 +152,12 @@ tests/test_st$(EXE): tests/test_st.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_tok$(EXE): tests/test_tok.c tok.h tok_unicode.h json.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_qwen_units$(EXE): tests/test_qwen_units.c qwen.c st.h json.h tok.h tok_unicode.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_qwen_tiny$(EXE): tests/test_qwen_tiny.c qwen.c st.h json.h tok.h tok_unicode.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_tier$(EXE): tests/test_tier.c tier.h
@@ -191,4 +201,4 @@ check:
 clean:
 	rm -f glm glm.exe olmoe olmoe.exe qwen qwen.exe $(TEST_BINS) tests/test_uring tests/test_uring.exe
 
-.PHONY: all glm olmoe portable test-c test check clean
+.PHONY: all glm olmoe qwen portable test-c test check clean
