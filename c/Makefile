@@ -193,7 +193,14 @@ tests/test_uring$(EXE): tests/test_uring.c glm.c st.h uring.h json.h tok.h tok_u
 test-c: $(TEST_BINS)
 	@set -e; for t in $(TEST_BINS); do echo "== $$t"; ./$$t; done
 
-test: test-c
+# GoogleTest suite: separate CMake build path (engines stay on plain make).
+# First configure downloads a pinned gtest via FetchContent unless a system
+# GTest is found.
+TESTS_BUILD ?= tests/build
+test:
+	cmake -S tests -B $(TESTS_BUILD)
+	cmake --build $(TESTS_BUILD) -j
+	ctest --test-dir $(TESTS_BUILD) --output-on-failure
 
 # Local validation: one portable CPU build and dependency-free tests.
 check:

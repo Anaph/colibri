@@ -12,7 +12,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Cache gtest (FetchContent)
+        uses: actions/cache@v4
+        with:
+          path: c/tests/build/_deps
+          key: gtest-v1.14.0
       - name: Build engines
         run: cd c && make all
-      - name: C test suite
-        run: cd c && make test-c
+      - name: Test suite (gtest via CMake + ctest)
+        run: cd c && make test

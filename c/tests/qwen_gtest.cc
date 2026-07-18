@@ -1,0 +1,31 @@
+// Glue gtest per qwen_tests.c: SOLO dichiarazioni extern "C" e macro TEST.
+#include <gtest/gtest.h>
+
+extern "C" {
+int qt_rope(void);
+int qt_gqa(void);
+int qt_quant(void);
+int qt_sampler(void);
+int qt_edges(void);
+int qt_gated_layout(void);
+int qt_deltanet_small(void);
+int qt_deltanet_large(void);
+int qt_tiny_dense(void);
+int qt_tiny_qbits(void);
+int qt_tiny_hybrid(void);
+}
+
+#define C_TEST(suite, name, fn) \
+    TEST(suite, name) { int r = fn(); if (r == 2) GTEST_SKIP(); EXPECT_EQ(0, r); }
+
+C_TEST(QwenRope,     MatchesDoubleRef,  qt_rope)
+C_TEST(QwenGqa,      MatchesReplicated, qt_gqa)
+C_TEST(QwenQuant,    Int8Tolerance,     qt_quant)
+C_TEST(QwenSampler,  Deterministic,     qt_sampler)
+C_TEST(QwenDeltanet, NumericEdges,      qt_edges)
+C_TEST(QwenGated,    QProjLayout,       qt_gated_layout)
+C_TEST(QwenDeltanet, DoubleRefSmall,    qt_deltanet_small)
+C_TEST(QwenDeltanet, DoubleRefLarge,    qt_deltanet_large)
+C_TEST(QwenTiny,     DenseDeterministic, qt_tiny_dense)
+C_TEST(QwenTiny,     Qbits8Finite,       qt_tiny_qbits)
+C_TEST(QwenTiny,     HybridDeterministic, qt_tiny_hybrid)

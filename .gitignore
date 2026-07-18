@@ -68,3 +68,4 @@ c/tests/test_decode_batch
 c/tests/test_i4_acc512
 c/tests/test_idot
 c/tests/test_uring
+c/tests/build/
