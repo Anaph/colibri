@@ -105,5 +105,37 @@ int main(int argc, char **argv) {
                 t, (fl_rec+fl_mm)/t/1e9, "-", T/t);
         free(x); free(out);
     }
+    /* (e) attention in decode a contesto lungo: 1 token nuovo, T=2048 in cache
+     * (layer denso finto H=32 KV=8 hd=128 D=4096; K/V pre-riempite random) */
+    {
+        int D = 4096, H = 32, KV = 8, hd = 128, T = 2048, iters = 200;
+        Model m; memset(&m, 0, sizeof m);
+        m.c.hidden = D; m.c.n_heads = H; m.c.n_kv_heads = KV; m.c.head_dim = hd;
+        m.c.rot = hd; m.c.theta = 1e6f; m.c.eps = 1e-6f; m.c.n_layers = 1;
+        static int lt[1] = {LT_FULL}; m.c.ltype = lt;
+        Layer l; memset(&l, 0, sizeof l);
+        l.type = LT_FULL;
+        #define MKB(mat, O_, I_) do { l.mat.O = O_; l.mat.I = I_; \
+            l.mat.f = falloc((int64_t)(O_)*(I_)); bn_fill(l.mat.f, (int64_t)(O_)*(I_)); } while (0)
+        MKB(q, H*hd, D); MKB(k, KV*hd, D); MKB(v, KV*hd, D); MKB(o, D, H*hd);
+        #undef MKB
+        l.qn = falloc(hd); bn_fill(l.qn, hd);
+        l.kn = falloc(hd); bn_fill(l.kn, hd);
+        kv_alloc(&m, T + 1);
+        bn_fill(m.K[0], (int64_t)KV*(T+1)*hd);          /* cache pre-riempita direttamente */
+        bn_fill(m.V[0], (int64_t)KV*(T+1)*hd);
+        float *x = falloc(D), *out = falloc(D);
+        bn_fill(x, D);
+        attention(&m, &l, 0, x, 1, T, out);             /* warm-up */
+        double t0 = now_s();
+        for (int it = 0; it < iters; it++) attention(&m, &l, 0, x, 1, T, out);
+        double t = now_s() - t0;
+        double fl = 2.0*2.0*H*hd*(double)T*iters;       /* punteggi + contesto */
+        double by = 2.0*KV*(double)T*hd*4*iters;        /* byte K+V letti dalla cache */
+        fprintf(stderr, "%-28s %10.4f %10.2f %10.2f\n", "attention decode T=2048",
+                t, fl/t/1e9, by/t/1e9);
+        free(l.q.f); free(l.k.f); free(l.v.f); free(l.o.f);
+        free(l.qn); free(l.kn); free(x); free(out);
+    }
     return 0;
 }

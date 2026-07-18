@@ -76,6 +76,7 @@ typedef struct {
     Layer *L;
     /* kv-cache per-layer: K,V come [n_kv_heads * max_t * head_dim] */
     float **K, **V; int kv_len, max_t;
+    float *att_sc;              /* scratch punteggi attention: [n_thread][max_t] */
     /* streaming a budget (MEM_GB/MEM_FRAC): i primi n_resident layer stanno in
      * RAM, gli altri vengono riletti dal disco a ogni step in stream_buf */
     int n_resident;
@@ -372,31 +373,28 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     }
     float scale = 1.f / sqrtf((float)hd);
     float *ctx = falloc(S*qw);
-    int Tk = pos_base + S;
-    #pragma omp parallel
-    {
-        float *sc = falloc(Tk);
-        #pragma omp for collapse(2) schedule(static)
-        for (int hh = 0; hh < H; hh++) {
-            for (int s = 0; s < S; s++) {
-                int kvh = hh / G;                 /* GQA: testa kv condivisa */
-                int qpos = pos_base + s;
-                const float *qv = q + s*qw + (int64_t)hh*hd;
-                for (int t = 0; t <= qpos; t++) {
-                    const float *kr = m->K[layer] + ((int64_t)kvh*m->max_t + t)*hd;
-                    sc[t] = dot_f32(qv, kr, hd) * scale;
-                }
-                softmax_row(sc, qpos+1);
-                float *cx = ctx + s*qw + (int64_t)hh*hd;
-                for (int dd = 0; dd < hd; dd++) cx[dd] = 0;
-                for (int t = 0; t <= qpos; t++) {
-                    const float *vr = m->V[layer] + ((int64_t)kvh*m->max_t + t)*hd;
-                    float a = sc[t];
-                    for (int dd = 0; dd < hd; dd++) cx[dd] += a * vr[dd];
-                }
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int hh = 0; hh < H; hh++) {
+        for (int s = 0; s < S; s++) {
+            /* scratch pre-allocato per thread (att_sc, vedi kv_alloc): niente
+             * malloc/free dentro la regione calda */
+            float *sc = m->att_sc + (int64_t)omp_get_thread_num() * m->max_t;
+            int kvh = hh / G;                 /* GQA: testa kv condivisa */
+            int qpos = pos_base + s;
+            const float *qv = q + s*qw + (int64_t)hh*hd;
+            for (int t = 0; t <= qpos; t++) {
+                const float *kr = m->K[layer] + ((int64_t)kvh*m->max_t + t)*hd;
+                sc[t] = dot_f32(qv, kr, hd) * scale;
+            }
+            softmax_row(sc, qpos+1);
+            float *cx = ctx + s*qw + (int64_t)hh*hd;
+            for (int dd = 0; dd < hd; dd++) cx[dd] = 0;
+            for (int t = 0; t <= qpos; t++) {
+                const float *vr = m->V[layer] + ((int64_t)kvh*m->max_t + t)*hd;
+                float a = sc[t];
+                for (int dd = 0; dd < hd; dd++) cx[dd] += a * vr[dd];
             }
         }
-        free(sc);
     }
     if (gate) {                            /* Qwen3.5: gating per-elemento sull'output */
         for (int64_t i = 0; i < S*qw; i++) ctx[i] *= 1.f/(1.f + expf(-gate[i]));
@@ -535,6 +533,10 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
 static void kv_alloc(Model *m, int max_t) {
     Cfg *c = &m->c;
     m->max_t = max_t; m->kv_len = 0;
+    /* scratch punteggi dimensionato QUI: THREADS viene applicato prima, in
+     * engine_main, e OMP_DYNAMIC=FALSE tiene il team fisso; alzare il numero
+     * di thread dopo kv_alloc non e' supportato. */
+    m->att_sc = falloc((int64_t)omp_get_max_threads() * max_t);
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++) {
         if (c->ltype[i] == LT_LINEAR) continue;  /* i layer lineari usano lo stato, non la KV */
