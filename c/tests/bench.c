@@ -53,6 +53,31 @@ int main(int argc, char **argv) {
                 t, fl/t/1e9, (double)O*I*1*iters/t/1e9);
         free(W); free(x); free(y); free(q); free(qs);
     }
+    /* (b2) matmul_q_s in batch (prefill): il peso viene letto una volta per
+     * S righe di attivazione — GB/s pesi ~costante, GFLOP/s scala con S */
+    {
+        int O = 4096, I = 4096, iters = 50;
+        static const int SS[2] = {8, 64};
+        float *W = falloc((int64_t)O*I);
+        int8_t *q = malloc((int64_t)O*I); float *qs = falloc(O);
+        bn_fill(W, (int64_t)O*I);
+        quantize_rows(W, q, qs, O, I, 8);
+        for (int si = 0; si < 2; si++) {
+            int S = SS[si];
+            float *x = falloc((int64_t)S*I), *y = falloc((int64_t)S*O);
+            bn_fill(x, (int64_t)S*I);
+            matmul_q_s(y, x, q, qs, S, I, O);           /* warm-up */
+            double t0 = now_s();
+            for (int it = 0; it < iters; it++) matmul_q_s(y, x, q, qs, S, I, O);
+            double t = now_s() - t0;
+            double fl = 2.0*O*I*(double)S*iters;
+            char nm[64]; snprintf(nm, sizeof nm, "matmul_q int8 4096x4096 S=%d", S);
+            fprintf(stderr, "%-28s %10.4f %10.2f %10.2f\n", nm,
+                    t, fl/t/1e9, (double)O*I*1*iters/t/1e9);
+            free(x); free(y);
+        }
+        free(W); free(q); free(qs);
+    }
     /* (c) dot_f32 forma attention: 4096 dot di lunghezza 128 */
     {
         int T = 4096, hd = 128, iters = 1000;

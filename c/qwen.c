@@ -482,17 +482,15 @@ static void deltanet(Model *m, Layer *l, float *x, int S, float *out) {
         deltanet_token(m, l, x + (int64_t)s*D, out + (int64_t)s*D);
 }
 
-/* SwiGLU denso: out[S,D] = down( silu(gate(x)) * up(x) ), per-riga per limitare i buffer */
+/* SwiGLU denso: out[S,D] = down( silu(gate(x)) * up(x) ), in batch sugli S
+ * token: ogni riga di peso viene letta una volta sola per l'intero batch */
 static void mlp(Model *m, Layer *l, float *x, int S, float *out) {
-    Cfg *c = &m->c; int D = c->hidden, I = c->inter;
-    float *g = falloc(I), *u = falloc(I);
-    for (int s = 0; s < S; s++) {
-        const float *xs = x + (int64_t)s*D;
-        mat_apply(g, xs, &l->gate, 1);
-        mat_apply(u, xs, &l->up,   1);
-        for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
-        mat_apply(out + (int64_t)s*D, g, &l->down, 1);
-    }
+    Cfg *c = &m->c; int I = c->inter;
+    float *g = falloc((int64_t)S*I), *u = falloc((int64_t)S*I);
+    mat_apply(g, x, &l->gate, S);
+    mat_apply(u, x, &l->up,   S);
+    for (int64_t i = 0; i < (int64_t)S*I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
+    mat_apply(out, g, &l->down, S);
     free(g); free(u);
 }
 

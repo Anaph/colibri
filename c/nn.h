@@ -54,29 +54,54 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
     }
 }
 
-/* y[1,O] = x[1,I] @ W^T con W int8 + scala per riga: schema Q8_0 di glm.c su
+/* y[S,O] = x[S,I] @ W^T con W int8 + scala per riga: schema Q8_0 di glm.c su
  * TUTTE le piattaforme (attivazione quantizzata per riga, dot INTERO via
- * dot_i8i8). xi vive sullo stack del thread chiamante ed e' letto in
- * condivisione dentro la regione omp: nessuna copia per thread. */
-static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
+ * dot_i8i8). Le S righe di attivazione vengono quantizzate UNA volta e ogni
+ * riga di peso viene letta UNA volta per tutte le S righe: in prefill il
+ * traffico sui pesi non cresce con S. Scratch statico che cresce e basta:
+ * contratto di chiamata SERIALE (mai da dentro una regione parallela), come
+ * tutti i kernel di questo header. */
+static void matmul_q_s(float *y, const float *x, const int8_t *q, const float *scale, int S, int I, int O) {
     static int idot = -1;
     if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
     if (idot && I <= NN_QROW_MAX) {
-        int8_t xi[NN_QROW_MAX];
-        float sx = qrow_i8(x, xi, I);
+        static int8_t *xi = NULL; static float *sx = NULL;
+        static int64_t xcap = 0, scap = 0;
+        if ((int64_t)S*I > xcap) {
+            xcap = (int64_t)S*I;
+            xi = realloc(xi, xcap);
+            if (!xi) { fprintf(stderr, "OOM %ld\n", (long)xcap); exit(1); }
+        }
+        if (S > scap) {
+            scap = S;
+            sx = realloc(sx, scap*sizeof(float));
+            if (!sx) { fprintf(stderr, "OOM %ld\n", (long)scap); exit(1); }
+        }
+        for (int s = 0; s < S; s++) sx[s] = qrow_i8(x + (int64_t)s*I, xi + (int64_t)s*I, I);
         #pragma omp parallel for schedule(static)
-        for (int o = 0; o < O; o++)
-            y[o] = scale[o] * sx * (float)dot_i8i8(q + (int64_t)o*I, xi, I);
+        for (int o = 0; o < O; o++) {
+            const int8_t *w = q + (int64_t)o*I;
+            for (int s = 0; s < S; s++)
+                y[(int64_t)s*O + o] = scale[o] * sx[s] * (float)dot_i8i8(w, xi + (int64_t)s*I, I);
+        }
         return;
     }
     /* IDOT=0: percorso esatto f32*int8, invariato */
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; o++) {
         const int8_t *w = q + (int64_t)o * I;
-        float acc = 0.f;
-        for (int i = 0; i < I; i++) acc += x[i] * (float)w[i];
-        y[o] = acc * scale[o];
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s*I;
+            float acc = 0.f;
+            for (int i = 0; i < I; i++) acc += xs[i] * (float)w[i];
+            y[(int64_t)s*O + o] = acc * scale[o];
+        }
     }
+}
+
+/* forma a riga singola, per i chiamanti che restano token-per-token */
+static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
+    matmul_q_s(y, x, q, scale, 1, I, O);
 }
 
 /* quantizzazione simmetrica per riga (come olmoe.c) */
@@ -100,7 +125,7 @@ static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I,
 
 /* y[S,O] = x[S,I] @ W^T qualunque sia lo storage del peso */
 static void mat_apply(float *y, const float *x, const Mat *w, int S) {
-    if (w->q) { for (int s = 0; s < S; s++) matmul_q(y + (int64_t)s*w->O, x + (int64_t)s*w->I, w->q, w->qs, w->I, w->O); }
+    if (w->q) matmul_q_s(y, x, w->q, w->qs, S, w->I, w->O);
     else matmul(y, x, w->f, S, w->I, w->O);
 }
 

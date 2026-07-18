@@ -5,6 +5,7 @@ extern "C" {
 int qt_rope(void);
 int qt_gqa(void);
 int qt_quant(void);
+int qt_quant_batch(void);
 int qt_sampler(void);
 int qt_edges(void);
 int qt_gated_layout(void);
@@ -27,6 +28,7 @@ int qt_tta_ppl_proxy(void);
 C_TEST(QwenRope,     MatchesDoubleRef,  qt_rope)
 C_TEST(QwenGqa,      MatchesReplicated, qt_gqa)
 C_TEST(QwenQuant,    Int8Tolerance,     qt_quant)
+C_TEST(QwenQuant,    BatchBitExact,     qt_quant_batch)
 C_TEST(QwenSampler,  Deterministic,     qt_sampler)
 C_TEST(QwenDeltanet, NumericEdges,      qt_edges)
 C_TEST(QwenGated,    QProjLayout,       qt_gated_layout)

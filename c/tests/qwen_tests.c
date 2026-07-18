@@ -91,6 +91,22 @@ int qt_quant(void) {
     return 0;
 }
 
+/* ---- matmul_q_s: batch S=4 bit-esatto rispetto a 4 chiamate S=1 ---- */
+int qt_quant_batch(void) {
+    int O = 24, I = 32, S = 4;
+    float *w = falloc((int64_t)O*I), *x = falloc((int64_t)S*I);
+    qt_rng_s = 45;
+    qt_fill(w,(int64_t)O*I,1); qt_fill(x,(int64_t)S*I,1);
+    int8_t *q = malloc((int64_t)O*I); float *qs = falloc(O);
+    quantize_rows(w, q, qs, O, I, 8);
+    float *yb = falloc((int64_t)S*O), *y1 = falloc((int64_t)S*O);
+    matmul_q_s(yb, x, q, qs, S, I, O);
+    for (int s = 0; s < S; s++) matmul_q(y1 + (int64_t)s*O, x + (int64_t)s*I, q, qs, I, O);
+    CHECK(memcmp(yb, y1, (size_t)S*O*sizeof(float)) == 0);
+    free(w); free(x); free(q); free(qs); free(yb); free(y1);
+    return 0;
+}
+
 /* ---- sampler: stesso seed -> stessa sequenza; greedy = argmax ---- */
 int qt_sampler(void) {
     int V = 100; float lo[100];

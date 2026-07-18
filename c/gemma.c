@@ -393,15 +393,13 @@ static inline float gelu_tanh(float x) {
     return 0.5f*x*(1.f + tanhf(0.7978845608028654f*(x + 0.044715f*x*x*x)));
 }
 static void mlp(Model *m, Layer *l, float *x, int S, float *out) {
-    Cfg *c = &m->c; int D = c->hidden, I = c->inter;
-    float *g = falloc(I), *u = falloc(I);
-    for (int s = 0; s < S; s++) {
-        const float *xs = x + (int64_t)s*D;
-        mat_apply(g, xs, &l->gate, 1);
-        mat_apply(u, xs, &l->up,   1);
-        for (int i = 0; i < I; i++) g[i] = gelu_tanh(g[i]) * u[i];
-        mat_apply(out + (int64_t)s*D, g, &l->down, 1);
-    }
+    /* in batch sugli S token: ogni riga di peso letta una volta per il batch */
+    Cfg *c = &m->c; int I = c->inter;
+    float *g = falloc((int64_t)S*I), *u = falloc((int64_t)S*I);
+    mat_apply(g, x, &l->gate, S);
+    mat_apply(u, x, &l->up,   S);
+    for (int64_t i = 0; i < (int64_t)S*I; i++) g[i] = gelu_tanh(g[i]) * u[i];
+    mat_apply(out, g, &l->down, S);
     free(g); free(u);
 }
 
