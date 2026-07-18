@@ -55,6 +55,7 @@ endfunction()
 
 colibri_test(test_headers headers_tests.c headers_gtest.cc)
 colibri_test(test_qwen    qwen_tests.c    qwen_gtest.cc)
+colibri_test(test_gemma   gemma_tests.c   gemma_gtest.cc)
 colibri_test(test_glm     glm_tests.c     glm_gtest.cc)
 
 # utility C pura (non un test ctest): parita' del tokenizer contro un corpus HF

@@ -106,12 +106,13 @@ EXE     =
 endif
 endif
 
-all: glm$(EXE) olmoe$(EXE) qwen$(EXE)
+all: glm$(EXE) olmoe$(EXE) qwen$(EXE) gemma$(EXE)
 
 # phony aliases → '<name>.exe' on Windows (so 'make glm' works on every platform)
 glm: glm$(EXE)
 olmoe: olmoe$(EXE)
 qwen: qwen$(EXE)
+gemma: gemma$(EXE)
 
 glm$(EXE): glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h
 	$(CC) $(CFLAGS) glm.c -o glm$(EXE) $(LDFLAGS)
@@ -121,6 +122,9 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h
 
 qwen$(EXE): qwen.c nn.h st.h json.h tok.h tok_unicode.h compat.h
 	$(CC) $(CFLAGS) qwen.c -o qwen$(EXE) $(LDFLAGS)
+
+gemma$(EXE): gemma.c nn.h st.h json.h tok.h tok_unicode.h compat.h
+	$(CC) $(CFLAGS) gemma.c -o gemma$(EXE) $(LDFLAGS)
 
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
@@ -159,4 +163,4 @@ clean:
 	rm -f glm glm.exe olmoe olmoe.exe qwen qwen.exe gemma gemma.exe
 	rm -rf $(TESTS_BUILD)
 
-.PHONY: all glm olmoe qwen portable test check clean
+.PHONY: all glm olmoe qwen gemma portable test check clean
