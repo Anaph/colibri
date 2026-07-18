@@ -1,13 +1,64 @@
-/* Validazione del tokenizer C contro l'oracolo HF.
- * build da c/: gcc -O2 tests/test_tok.c -o tok_test
- * uso:  ./tok_test <tokenizer.json>   (legge righe "TEXT\tID,ID,.." da stdin) */
+/* Validazione del tokenizer C.
+ * build da c/: make tests/test_tok
+ * uso:  ./tests/test_tok <tokenizer.json> < cases   (righe "TEXT\tID,ID,..")
+ *       ./tests/test_tok                            (fixture integrata)
+ */
 #define _GNU_SOURCE
 #include "../tok.h"
 
-int main(int argc, char **argv){
-    if(argc<2){ fprintf(stderr,"usage: %s tokenizer.json < cases\n",argv[0]); return 1; }
+/* --- fixture integrata: micro-vocabolario in entrambi i formati merges ---
+ * vocab: h,e,l,o,Ġ,he,ll,hell,hello + speciale <|endoftext|>
+ * "hello hello<|endoftext|>" -> [hello][Ġ][h][e][ll][o][eot]  (spazio: "Ġhello"
+ * non e' nel vocab, quindi il secondo hello resta spezzato: Ġ h e ll o... in
+ * realta' i merges lo ricompongono solo dove il rank lo permette) */
+static const char *FIX_PAIRS =
+  "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"h\":0,\"e\":1,\"l\":2,\"o\":3,\"\\u0120\":4,"
+  "\"he\":5,\"ll\":6,\"hell\":7,\"hello\":8},"
+  "\"merges\":[[\"h\",\"e\"],[\"l\",\"l\"],[\"he\",\"ll\"],[\"hell\",\"o\"]]},"
+  "\"added_tokens\":[{\"id\":9,\"content\":\"<|endoftext|>\"}]}";
+static const char *FIX_STRINGS =
+  "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"h\":0,\"e\":1,\"l\":2,\"o\":3,\"\\u0120\":4,"
+  "\"he\":5,\"ll\":6,\"hell\":7,\"hello\":8},"
+  "\"merges\":[\"h e\",\"l l\",\"he ll\",\"hell o\"]},"
+  "\"added_tokens\":[{\"id\":9,\"content\":\"<|endoftext|>\"}]}";
+
+static void write_tmp(const char *path, const char *body){
+    FILE *f=fopen(path,"wb"); if(!f){ perror(path); exit(1); }
+    fwrite(body,1,strlen(body),f); fclose(f);
+}
+
+static int run_fixture(const char *name, const char *body){
+    char path[512];
+    const char *tmp=getenv("TMPDIR"); if(!tmp) tmp="/tmp";
+    snprintf(path,sizeof(path),"%s/tok_fix_%s.json",tmp,name);
+    write_tmp(path,body);
+    Tok T; tok_load(&T,path);
+    int fail=0;
+
+    /* "hello" -> merges completi -> un token */
+    int ids[64]; int n=tok_encode(&T,"hello",5,ids,64);
+    if(!(n==1 && ids[0]==8)){ fprintf(stderr,"[%s] encode(hello): atteso [8], got n=%d\n",name,n); fail=1; }
+
+    /* added token atomico + testo intorno */
+    n=tok_encode(&T,"hello<|endoftext|>hello",23,ids,64);
+    if(!(n==3 && ids[0]==8 && ids[1]==9 && ids[2]==8)){
+        fprintf(stderr,"[%s] encode(hello<eot>hello): got n=%d [",name,n);
+        for(int i=0;i<n;i++)fprintf(stderr," %d",ids[i]); fprintf(stderr," ]\n"); fail=1;
+    }
+
+    /* round-trip decode del testo normale */
+    n=tok_encode(&T,"hello",5,ids,64);
+    char dec[64]; int dn=tok_decode(&T,ids,n,dec,63);
+    if(!(dn==5 && !memcmp(dec,"hello",5))){ fprintf(stderr,"[%s] decode round-trip fallito\n",name); fail=1; }
+
+    remove(path);
+    if(!fail) fprintf(stderr,"[%s] ok\n",name);
+    return fail;
+}
+
+static int run_oracle(const char *tokpath){
     Tok T;
-    tok_load(&T, argv[1]);
+    tok_load(&T, tokpath);
     fprintf(stderr,"loaded: vocab_ids=%d specials=%d\n", T.n_ids, T.nsp);
     char *line=NULL; size_t cap=0; ssize_t nr;
     int pass=0, tot=0, dpass=0;
@@ -43,4 +94,13 @@ int main(int argc, char **argv){
     }
     printf("ENCODE: %d/%d  DECODE(round-trip): %d/%d\n", pass,tot, dpass,tot);
     return pass==tot ? 0 : 2;
+}
+
+int main(int argc, char **argv){
+    if(argc>=2) return run_oracle(argv[1]);
+    int fail = 0;
+    fail |= run_fixture("pairs",   FIX_PAIRS);    /* formato GLM: coppie */
+    fail |= run_fixture("strings", FIX_STRINGS);  /* formato Qwen: "a b" */
+    if(!fail) printf("test_tok: ok\n");
+    return fail;
 }

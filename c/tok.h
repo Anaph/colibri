@@ -115,12 +115,23 @@ static void tok_load(Tok *T, const char *path){
         hm_put(&T->vocab, k, (int)strlen(k), id);
         T->id2str[id]=(char*)k;
     }
-    /* merges: "left\0right" -> rank=i */
+    /* merges: "left\0right" -> rank=i
+     * Due formati in circolazione: coppie ["left","right"] (GLM) oppure
+     * stringhe "left right" con separatore spazio singolo (Qwen/GPT-2). */
     int mc=1; while(mc < merges->len*2) mc<<=1;
     hm_init(&T->merges, mc);
     for(int i=0;i<merges->len;i++){
         jval *pr=merges->kids[i];
-        const char *l=pr->kids[0]->str, *r=pr->kids[1]->str;
+        const char *l, *r;
+        if(pr->t==J_STR){
+            const char *sp=strchr(pr->str,' ');
+            if(!sp){ fprintf(stderr,"tokenizer.json: merge senza spazio: %s\n",pr->str); exit(1); }
+            int ll=(int)(sp-pr->str), rl=(int)strlen(sp+1);
+            char *key=malloc(ll+1+rl); memcpy(key,pr->str,ll); key[ll]=0; memcpy(key+ll+1,sp+1,rl);
+            hm_put(&T->merges, key, ll+1+rl, i);
+            continue;
+        }
+        l=pr->kids[0]->str; r=pr->kids[1]->str;
         int ll=(int)strlen(l), rl=(int)strlen(r);
         char *key=malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
         hm_put(&T->merges, key, ll+1+rl, i);
