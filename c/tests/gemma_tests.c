@@ -55,7 +55,7 @@ int gm_geglu(void) {
 
 /* ---- RMSNorm: entrambe le convenzioni ---- */
 int gm_rmsnorm(void) {
-    GCfg c; memset(&c,0,sizeof c); c.eps = 1e-6f;
+    Cfg c; memset(&c,0,sizeof c); c.eps = 1e-6f;
     float x[4] = {1, -2, 3, -4}, w[4] = {0.1f, 0.2f, -0.1f, 0.0f}, out[4];
     double ms = (1.0+4+9+16)/4.0;
     double r = 1.0/sqrt(ms + 1e-6);
@@ -71,7 +71,7 @@ int gm_rmsnorm(void) {
 /* ---- sliding mask: attention() vs riferimento brute-force double con finestra ---- */
 int gm_sliding(void) {
     int D = 8, H = 2, KV = 2, hd = 4, S = 5, W = 2;
-    GModel m; memset(&m,0,sizeof m);
+    Model m; memset(&m,0,sizeof m);
     m.c.hidden=D; m.c.n_heads=H; m.c.n_kv_heads=KV; m.c.n_gkv=KV;
     m.c.head_dim=hd; m.c.ghd=hd; m.c.rot_angles=hd/2;
     m.c.theta_g=1e6f; m.c.theta_l=1e4f; m.c.eps=1e-6f; m.c.n_layers=1; m.c.window=W;
@@ -79,7 +79,7 @@ int gm_sliding(void) {
     static int lt[1] = {0};                          /* sliding */
     static int ks[1] = {0};
     m.c.ltype = lt; m.c.kv_src = ks;
-    GLayer l; memset(&l,0,sizeof l);
+    Layer l; memset(&l,0,sizeof l);
     l.type = 0;
     l.q.f=falloc((int64_t)H*hd*D);  l.q.O=H*hd;  l.q.I=D;
     l.k.f=falloc((int64_t)KV*hd*D); l.k.O=KV*hd; l.k.I=D;
@@ -198,7 +198,7 @@ static void gm_write_tiny(const char *dir, int kv_shared, int k_eq_v) {
 }
 
 static int gm_run8(const char *dir, int qbits, int *out, int expect_shared, int expect_keqv) {
-    GModel m;
+    Model m;
     model_init(&m, dir, qbits);
     CHECK(m.lm_tied);
     CHECK(m.c.ltype[2] == 1 && m.c.ltype[0] == 0 && m.c.ltype[3] == 0);
@@ -254,7 +254,7 @@ int gm_tiny_keqv(void) {
 
 /* ---- MEM_GB/MEM_FRAC: parita' token con streaming ---- */
 static int gm_run8_budget(const char *dir, int64_t budget, int *out, int *resident_out) {
-    GModel m;
+    Model m;
     model_init_ex(&m, dir, 0, budget, 16);
     if (resident_out) *resident_out = m.n_resident;
     kv_alloc(&m, 16);

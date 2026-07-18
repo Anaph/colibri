@@ -55,7 +55,7 @@ typedef struct {
     int eos[4], n_eos;
     int *ltype;                 /* [n_layers] 1=full_attention 0=sliding_attention */
     int *kv_src;                /* [n_layers] layer sorgente del K/V (se' stesso se non condiviso) */
-} GCfg;
+} Cfg;
 
 typedef struct {
     int type;                   /* 1=full 0=sliding */
@@ -67,15 +67,15 @@ typedef struct {
     /* PLE */
     Mat ple_gate, ple_proj;     /* per_layer_input_gate [ple,D], per_layer_projection [D,ple] */
     float *ple_norm;            /* post_per_layer_input_norm [D] */
-} GLayer;
+} Layer;
 
 typedef struct {
-    GCfg c;
+    Cfg c;
     shards S;
     int qbits;
     float *embed, *final_norm;
     Mat lm_head; int lm_tied;
-    GLayer *L;
+    Layer *L;
     /* PLE globali */
     float *ple_embed;           /* [ple_vocab, n_layers*ple_dim] */
     Mat ple_model_proj;         /* [n_layers*ple_dim, D] */
@@ -85,13 +85,13 @@ typedef struct {
     int n_resident;
     float *stream_buf;
     double load_s;
-} GModel;
+} Model;
 
 /* ---------- config ---------- */
 #define CKR(name, v, lo, hi) do { long _v=(long)(v); if(_v<(lo)||_v>(hi)){ \
     fprintf(stderr,"config.json: %s=%ld fuori range [%ld,%ld]\n",name,_v,(long)(lo),(long)(hi)); exit(1);} } while(0)
 
-static void load_cfg(GCfg *c, const char *snap) {
+static void load_cfg(Cfg *c, const char *snap) {
     char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap);
     FILE *f = fopen(path, "rb"); if(!f){perror(path);exit(1);}
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
@@ -193,7 +193,7 @@ static void load_cfg(GCfg *c, const char *snap) {
 }
 
 /* ---------- caricamento pesi ---------- */
-static float *load_t(GModel *m, const char *name, int64_t expect) {
+static float *load_t(Model *m, const char *name, int64_t expect) {
     int64_t n = st_numel(&m->S, name);
     if (n < 0) { fprintf(stderr, "missing tensor %s\n", name); exit(1); }
     if (expect > 0 && n != expect) {
@@ -206,7 +206,7 @@ static float *load_t(GModel *m, const char *name, int64_t expect) {
     return p;
 }
 
-static void load_mat(GModel *m, Mat *w, const char *name, int O, int I) {
+static void load_mat(Model *m, Mat *w, const char *name, int O, int I) {
     w->O = O; w->I = I; w->q = NULL; w->qs = NULL;
     w->f = load_t(m, name, (int64_t)O*I);
     if (m->qbits == 8) {
@@ -219,7 +219,7 @@ static void load_mat(GModel *m, Mat *w, const char *name, int O, int I) {
 
 /* probe: primo nome esistente tra i candidati; se nessuno, li stampa ed esce.
  * Serve al bring-up sul checkpoint reale: i nomi VERIFY falliscono parlando. */
-static const char *probe_name(GModel *m, char *buf, int cap, int required, int n, ...) {
+static const char *probe_name(Model *m, char *buf, int cap, int required, int n, ...) {
     va_list ap; va_start(ap, n);
     const char *cands[8]; int nc = 0;
     for (int i = 0; i < n && i < 8; i++) {
@@ -238,8 +238,8 @@ static const char *probe_name(GModel *m, char *buf, int cap, int required, int n
 /* elenco delle MATRICI streamabili di un layer (richiede type/shared_kv gia'
  * impostati; k/v assenti sui layer kv-shared, v assente con k_eq_v). */
 typedef struct { Mat *mat; char name[96]; int O, I; } MatRef;
-static int layer_matrefs(GModel *m, int li, MatRef *r) {
-    GCfg *c = &m->c; GLayer *l = &m->L[li];
+static int layer_matrefs(Model *m, int li, MatRef *r) {
+    Cfg *c = &m->c; Layer *l = &m->L[li];
     int n = 0, D = c->hidden;
     int hd = l->type ? c->ghd : c->head_dim;
     int KV = l->type ? c->n_gkv : c->n_kv_heads;
@@ -265,14 +265,14 @@ static int layer_matrefs(GModel *m, int li, MatRef *r) {
     return n;
 }
 
-static int64_t layer_f32_bytes(GModel *m, int li) {
+static int64_t layer_f32_bytes(Model *m, int li) {
     MatRef r[12]; int n = layer_matrefs(m, li, r);
     int64_t b = 0;
     for (int j = 0; j < n; j++) b += (int64_t)r[j].O*r[j].I*4;
     return b;
 }
 
-static void layer_stream_in(GModel *m, int li) {
+static void layer_stream_in(Model *m, int li) {
     MatRef r[12]; int n = layer_matrefs(m, li, r);
     int64_t off = 0;
     for (int j = 0; j < n; j++) {
@@ -284,7 +284,7 @@ static void layer_stream_in(GModel *m, int li) {
     }
 }
 
-static void layer_prefetch(GModel *m, int li) {
+static void layer_prefetch(Model *m, int li) {
 #ifndef _WIN32
     MatRef r[12]; int n = layer_matrefs(m, li, r);
     for (int j = 0; j < n; j++) st_prefetch(&m->S, r[j].name);
@@ -293,12 +293,12 @@ static void layer_prefetch(GModel *m, int li) {
 #endif
 }
 
-static void model_init_ex(GModel *m, const char *snap, int qbits, int64_t budget_bytes, int ctx_hint) {
+static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_bytes, int ctx_hint) {
     memset(m, 0, sizeof(*m));
     m->qbits = qbits;
     load_cfg(&m->c, snap);
     st_init(&m->S, snap);
-    GCfg *c = &m->c;
+    Cfg *c = &m->c;
     double t0 = now_s();
     int D = c->hidden;
     m->embed      = load_t(m, "model.embed_tokens.weight", (int64_t)c->vocab*D);
@@ -322,11 +322,11 @@ static void model_init_ex(GModel *m, const char *snap, int qbits, int64_t budget
             m->ple_proj_norm = load_t(m, nm, c->ple_dim);
         fprintf(stderr, "[gemma] PLE attivo: dim %d, vocab %d\n", c->ple_dim, c->ple_vocab);
     }
-    m->L = calloc(c->n_layers, sizeof(GLayer));
+    m->L = calloc(c->n_layers, sizeof(Layer));
     char nm[256];
     /* 1) parte piccola SEMPRE residente: norme + flag di struttura */
     for (int i = 0; i < c->n_layers; i++) {
-        GLayer *l = &m->L[i];
+        Layer *l = &m->L[i];
         l->type = c->ltype[i];
         int hd = l->type ? c->ghd : c->head_dim;
         #define LDT(field, suffix, n_) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm,n_)
@@ -400,12 +400,12 @@ static void model_init_ex(GModel *m, const char *snap, int qbits, int64_t budget
     m->load_s = now_s() - t0;
 }
 
-static void model_init(GModel *m, const char *snap, int qbits) {
+static void model_init(Model *m, const char *snap, int qbits) {
     model_init_ex(m, snap, qbits, 0, 0);
 }
 
 /* ---------- RMSNorm Gemma: peso (1+w) (zc) oppure w ---------- */
-static void gnorm_row(const GCfg *c, float *out, const float *x, const float *w, int D) {
+static void gnorm_row(const Cfg *c, float *out, const float *x, const float *w, int D) {
     double ms = 0; for (int i = 0; i < D; i++) ms += (double)x[i]*x[i];
     float r = 1.f / sqrtf((float)(ms / D) + c->eps);
     if (c->zc_norm) for (int i = 0; i < D; i++) out[i] = x[i] * r * (1.f + w[i]);
@@ -425,8 +425,8 @@ static void gemma_rope_head(float *x, int pos, float theta, int hd, int rot_angl
 }
 
 /* ---------- attenzione ibrida (GQA; sliding o full con p-RoPE) ---------- */
-static void attention(GModel *m, GLayer *l, int layer, float *x, int S, int pos_base, float *out) {
-    GCfg *c = &m->c;
+static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
+    Cfg *c = &m->c;
     int H = c->n_heads;
     int hd = l->type ? c->ghd : c->head_dim;
     int KV = l->type ? c->n_gkv : c->n_kv_heads;
@@ -517,8 +517,8 @@ static void attention(GModel *m, GLayer *l, int layer, float *x, int S, int pos_
 static inline float gelu_tanh(float x) {
     return 0.5f*x*(1.f + tanhf(0.7978845608028654f*(x + 0.044715f*x*x*x)));
 }
-static void mlp(GModel *m, GLayer *l, float *x, int S, float *out) {
-    GCfg *c = &m->c; int D = c->hidden, I = c->inter;
+static void mlp(Model *m, Layer *l, float *x, int S, float *out) {
+    Cfg *c = &m->c; int D = c->hidden, I = c->inter;
     float *g = falloc(I), *u = falloc(I);
     for (int s = 0; s < S; s++) {
         const float *xs = x + (int64_t)s*D;
@@ -533,8 +533,8 @@ static void mlp(GModel *m, GLayer *l, float *x, int S, float *out) {
 /* ---------- PLE: contributo per-layer nel residuo dopo il MLP ----------
  * combined[i] = (proj_ctx[i] + tok_embed[i]) / sqrt(2)   (per layer i)
  * poi in ogni layer: x += ple_proj( gelu(ple_gate(x)) * combined_i ), norm. */
-static void ple_inputs(GModel *m, const int *ids, int S, float *out /*[S, n_layers, ple]*/) {
-    GCfg *c = &m->c; int P = c->ple_dim, NL = c->n_layers, D = c->hidden;
+static void ple_inputs(Model *m, const int *ids, int S, float *out /*[S, n_layers, ple]*/) {
+    Cfg *c = &m->c; int P = c->ple_dim, NL = c->n_layers, D = c->hidden;
     float tok_scale = sqrtf((float)P);
     float inv_sqrt_d = 1.f/sqrtf((float)D), inv_sqrt2 = 1.f/sqrtf(2.f);
     float emb_scale = sqrtf((float)D);
@@ -564,8 +564,8 @@ static void ple_inputs(GModel *m, const int *ids, int S, float *out /*[S, n_laye
     free(xemb); free(proj);
 }
 
-static void ple_apply(GModel *m, GLayer *l, int li, const float *ple /*[S,NL,P]*/, float *x, int S) {
-    GCfg *c = &m->c; int D = c->hidden, P = c->ple_dim, NL = c->n_layers;
+static void ple_apply(Model *m, Layer *l, int li, const float *ple /*[S,NL,P]*/, float *x, int S) {
+    Cfg *c = &m->c; int D = c->hidden, P = c->ple_dim, NL = c->n_layers;
     float *g = falloc(P), *d = falloc(D), *nrm = falloc(D);
     for (int s = 0; s < S; s++) {
         float *xs = x + (int64_t)s*D;
@@ -581,8 +581,8 @@ static void ple_apply(GModel *m, GLayer *l, int li, const float *ple /*[S,NL,P]*
 }
 
 /* ---------- un passo ---------- */
-static float *step(GModel *m, const int *ids, int S, int pos_base) {
-    GCfg *c = &m->c; int D = c->hidden;
+static float *step(Model *m, const int *ids, int S, int pos_base) {
+    Cfg *c = &m->c; int D = c->hidden;
     float emb_scale = sqrtf((float)D);
     float *x = falloc((int64_t)S*D);
     for (int s = 0; s < S; s++)
@@ -596,7 +596,7 @@ static float *step(GModel *m, const int *ids, int S, int pos_base) {
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
     if (m->n_resident < c->n_layers) layer_prefetch(m, m->n_resident);
     for (int i = 0; i < c->n_layers; i++) {
-        GLayer *l = &m->L[i];
+        Layer *l = &m->L[i];
         if (i >= m->n_resident) {
             layer_stream_in(m, i);                  /* rilegge il layer dal disco (f32) */
             if (i + 1 < c->n_layers && i + 1 >= m->n_resident) layer_prefetch(m, i + 1);
@@ -631,8 +631,8 @@ static float *step(GModel *m, const int *ids, int S, int pos_base) {
     return logit;
 }
 
-static void kv_alloc(GModel *m, int max_t) {
-    GCfg *c = &m->c;
+static void kv_alloc(Model *m, int max_t) {
+    Cfg *c = &m->c;
     m->max_t = max_t; m->kv_len = 0;
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++) {
@@ -647,7 +647,7 @@ static void kv_alloc(GModel *m, int max_t) {
 }
 
 /* ---------- generazione di un turno (identica al protocollo qwen) ---------- */
-static int gen_turn(GModel *m, Tok *T, int *hist, int len, int k, int n_new, int echo, int *stopped) {
+static int gen_turn(Model *m, Tok *T, int *hist, int len, int k, int n_new, int echo, int *stopped) {
     int dump = getenv("TOKENS") && atoi(getenv("TOKENS"));
     double t0 = now_s();
     float *logit = step(m, hist + len, k, len);
@@ -688,7 +688,7 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
     *n_out = a->len; return r;
 }
 
-static int run_ref(GModel *m, const char *refpath) {
+static int run_ref(Model *m, const char *refpath) {
     FILE *f = fopen(refpath, "rb"); if(!f){perror(refpath);return 1;}
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
     char *buf=malloc(n+1); if(fread(buf,1,n,f)!=(size_t)n){} buf[n]=0; fclose(f);
@@ -745,7 +745,7 @@ int main(void) {
     int templ = getenv("CHAT_TEMPLATE") ? atoi(getenv("CHAT_TEMPLATE")) : 1;
     int64_t budget = budget_from_env(getenv("MEM_GB"), getenv("MEM_FRAC"), compat_total_ram_bytes());
 
-    GModel m;
+    Model m;
     model_init_ex(&m, snap, qbits, budget, maxctx);
     int nfull = 0; for (int i = 0; i < m.c.n_layers; i++) nfull += m.c.ltype[i];
     fprintf(stderr, "[gemma] %d layer (%d full/%d sliding, finestra %d), hidden %d, %d teste (hd %d/%d, rot %d), vocab %d%s%s%s | load %.1fs | RSS %.2f GB\n",
