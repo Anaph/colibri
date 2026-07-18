@@ -51,6 +51,7 @@ typedef struct {
 } Cfg;
 
 /* adattatore rank-r: y += (alpha/r) * B·(A·x); A[r,I], B[O,r]; B=0 => no-op */
+#define LORA_MAX_R 64
 typedef struct { float *A, *B; int r; float alpha; } Lora;
 typedef struct { Lora q, k, v, o, gate, up, down; } LoraLayer;
 
@@ -103,7 +104,7 @@ static void lora_load(Model *m);
 
 #include "runtime.h"
 
-enum { TTA_OFF = 0, TTA_CACHE = 1, TTA_BIAS = 2 };
+enum { TTA_OFF = 0, TTA_CACHE = 1, TTA_BIAS = 2, TTA_LORA = 3 };
 static struct {
     int init, alloc, mode;
     int n, len, head;           /* ring del cache: capacita', riempimento, prossimo slot */
@@ -112,6 +113,9 @@ static struct {
     int   *tok;                 /* [n] token osservato dopo h_i */
     float *h_cur; int h_valid;  /* [D] hidden della predizione corrente (stash di step) */
     float *bias;                /* [V] (modo bias) */
+    float *lA, *lB;             /* (modo lora) adattatore lm_head: A[r,D], B[V,r] */
+    int lr_rank; float l_alpha; /* rank r e alpha (=2r) dell'adattatore online */
+    float lt[LORA_MAX_R];       /* stash di A·h_cur calcolato in adjust (serve a observe) */
     float *p, *pc, *sc;         /* scratch: softmax corrente [V], distr. cache [V], scores [n] */
     int V, D;                   /* dimensioni al momento dell'alloc */
 } g_tta;
@@ -122,16 +126,19 @@ static void tta_ensure(Model *m) {
         const char *e = getenv("TTA");
         g_tta.mode = !e || !*e || !strcmp(e,"0") ? TTA_OFF
                    : !strcmp(e,"cache") ? TTA_CACHE
-                   : !strcmp(e,"bias")  ? TTA_BIAS : TTA_OFF;
+                   : !strcmp(e,"bias")  ? TTA_BIAS
+                   : !strcmp(e,"lora")  ? TTA_LORA : TTA_OFF;
         g_tta.n      = getenv("TTA_N")      ? atoi(getenv("TTA_N"))            : 2048;
-        g_tta.lr     = getenv("TTA_LR")     ? (float)atof(getenv("TTA_LR"))     : 0.1f;
+        g_tta.lr     = getenv("TTA_LR")     ? (float)atof(getenv("TTA_LR"))
+                                            : (g_tta.mode == TTA_LORA ? 1e-3f : 0.1f);
         g_tta.lambda = getenv("TTA_LAMBDA") ? (float)atof(getenv("TTA_LAMBDA")) : 0.1f;
         g_tta.theta  = getenv("TTA_THETA")  ? (float)atof(getenv("TTA_THETA"))  : 1.0f;
         if (g_tta.lambda < 0) g_tta.lambda = 0;
         if (g_tta.lambda > 0.5f) g_tta.lambda = 0.5f;   /* il cache non puo' dominare */
         if (g_tta.n < 1) g_tta.n = 1;
         if (g_tta.mode) fprintf(stderr, "[qwen] TTA sperimentale: %s (n=%d lr=%g lambda=%g theta=%g)\n",
-                                g_tta.mode==TTA_CACHE?"cache":"bias", g_tta.n, g_tta.lr, g_tta.lambda, g_tta.theta);
+                                g_tta.mode==TTA_CACHE?"cache":g_tta.mode==TTA_BIAS?"bias":"lora",
+                                g_tta.n, g_tta.lr, g_tta.lambda, g_tta.theta);
     }
     if (g_tta.mode && !g_tta.alloc) {
         int V = m->c.vocab, D = m->c.hidden;
@@ -143,6 +150,22 @@ static void tta_ensure(Model *m) {
         g_tta.pc    = falloc(V);
         g_tta.sc    = falloc(g_tta.n);
         g_tta.V = V; g_tta.D = D;
+        if (g_tta.mode == TTA_LORA) {
+            /* adattatore online sull'lm_head: A fissato casuale (deterministico),
+             * B parte a zero -> no-op finche' non si osservano token */
+            int r = getenv("TTA_RANK") ? atoi(getenv("TTA_RANK")) : 4;
+            if (r < 1) r = 1;
+            if (r > LORA_MAX_R) r = LORA_MAX_R;
+            g_tta.lr_rank = r; g_tta.l_alpha = 2.f * r;
+            g_tta.lA = falloc((int64_t)r * D);
+            uint64_t rs = 0x5EEDCAFE12345ULL;
+            float scn = 1.f / sqrtf((float)D);
+            for (int64_t i = 0; i < (int64_t)r * D; i++) {
+                rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17;
+                g_tta.lA[i] = ((float)((rs >> 11) * (1.0/9007199254740992.0)) * 2.f - 1.f) * scn;
+            }
+            g_tta.lB = calloc((int64_t)V * r, sizeof(float));
+        }
         g_tta.alloc = 1;
     }
 }
@@ -150,6 +173,10 @@ static void tta_ensure(Model *m) {
 static void tta_reset(void) {
     g_tta.len = 0; g_tta.head = 0; g_tta.h_valid = 0;
     if (g_tta.alloc) memset(g_tta.bias, 0, g_tta.V*sizeof(float));
+    /* lora: azzerare B rende l'adattatore un no-op esatto; A (proiezione
+     * casuale fissa) si conserva */
+    if (g_tta.alloc && g_tta.lB)
+        memset(g_tta.lB, 0, (int64_t)g_tta.V * g_tta.lr_rank * sizeof(float));
 }
 
 /* aggiusta i logits della predizione corrente (chiamato da gen_turn dopo step) */
@@ -159,6 +186,20 @@ static void tta_adjust(Model *m, float *lo) {
     int V = m->c.vocab, D = m->c.hidden;
     if (g_tta.mode == TTA_BIAS) {
         for (int v = 0; v < V; v++) lo[v] += g_tta.bias[v];
+        memcpy(g_tta.p, lo, V*sizeof(float));      /* softmax per l'update in observe */
+        softmax_row(g_tta.p, V);
+        return;
+    }
+    if (g_tta.mode == TTA_LORA) {
+        /* logits += (alpha/r) * B·(A·h_cur); t = A·h_cur stashato per observe */
+        if (g_tta.h_valid) {
+            int r = g_tta.lr_rank;
+            float sc = g_tta.l_alpha / r;
+            for (int j = 0; j < r; j++)
+                g_tta.lt[j] = dot_f32(g_tta.lA + (int64_t)j*D, g_tta.h_cur, D);
+            for (int v = 0; v < V; v++)
+                lo[v] += sc * dot_f32(g_tta.lB + (int64_t)v*r, g_tta.lt, r);
+        }
         memcpy(g_tta.p, lo, V*sizeof(float));      /* softmax per l'update in observe */
         softmax_row(g_tta.p, V);
         return;
@@ -190,6 +231,32 @@ static void tta_observe(Model *m, int tok) {
         g_tta.bias[tok] += g_tta.lr;
         return;
     }
+    if (g_tta.mode == TTA_LORA) {
+        /* SGD sulla CE dell'adattatore: g = p - e_tok (gradiente sui logit).
+         * dB[v,:] = sc*g_v*t, dA[j,:] = sc*bg_j*h con bg = B^T g calcolato
+         * PRIMA di aggiornare B (altrimenti il gradiente di A sarebbe sporco). */
+        if (!g_tta.h_valid) return;
+        int r = g_tta.lr_rank;
+        float sc = g_tta.l_alpha / r, step = g_tta.lr * sc;
+        float bg[LORA_MAX_R];
+        for (int j = 0; j < r; j++) bg[j] = 0;
+        for (int v = 0; v < V; v++) {
+            float gv = g_tta.p[v] - (v == tok ? 1.f : 0.f);
+            const float *Bv = g_tta.lB + (int64_t)v*r;
+            for (int j = 0; j < r; j++) bg[j] += gv * Bv[j];
+        }
+        for (int v = 0; v < V; v++) {
+            float gv = g_tta.p[v] - (v == tok ? 1.f : 0.f);
+            float *Bv = g_tta.lB + (int64_t)v*r;
+            for (int j = 0; j < r; j++) Bv[j] -= step * gv * g_tta.lt[j];
+        }
+        for (int j = 0; j < r; j++) {
+            float cj = step * bg[j];
+            float *Aj = g_tta.lA + (int64_t)j*D;
+            for (int d = 0; d < D; d++) Aj[d] -= cj * g_tta.h_cur[d];
+        }
+        return;
+    }
     if (!g_tta.h_valid) return;
     double s2 = 0; for (int d = 0; d < D; d++) s2 += (double)g_tta.h_cur[d]*g_tta.h_cur[d];
     float r = 1.f/sqrtf((float)s2 + 1e-12f);
@@ -205,7 +272,6 @@ static void tta_observe(Model *m, int tok) {
  * proiezione adattata. Caricati da LORA=<file|dir safetensors> con nomi
  * lora.layers.N.self_attn.{q,k,v,o}_proj.{A,B}, lora.layers.N.mlp.{gate,up,
  * down}_proj.{A,B}, lora.lm_head.{A,B} e scalare opzionale lora.alpha. */
-#define LORA_MAX_R 64
 
 /* applica l'adattatore su y[S,O] con input x[S,I]; seriale (r piccolo) */
 static void lora_apply(const Lora *lo, float *y, const float *x, int S, int I, int O) {
@@ -650,8 +716,8 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     m->kv_len = pos_base + S;
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
-    if (g_tta.mode == TTA_CACHE && g_tta.alloc) {   /* stash per il neural cache */
-        memcpy(g_tta.h_cur, last, D*sizeof(float));
+    if ((g_tta.mode == TTA_CACHE || g_tta.mode == TTA_LORA) && g_tta.alloc) {
+        memcpy(g_tta.h_cur, last, D*sizeof(float)); /* stash per cache / adattatore online */
         g_tta.h_valid = 1;
     }
     float *logit = falloc(c->vocab);

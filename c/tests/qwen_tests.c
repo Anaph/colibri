@@ -881,6 +881,79 @@ int qt_tta_bias_direction(void) {
     return 0;
 }
 
+/* ---- TTA=lora: adattatore online low-rank sull'lm_head ---- */
+
+/* protocollo a due step: prefill {1,2,3} + un decode; logits del decode */
+static float *qt_tta_two_steps(Model *m) {
+    kv_alloc(m, 16);
+    int ids[3] = {1,2,3};
+    float *l1 = step(m, ids, 3, 0);
+    tta_adjust(m, l1);
+    free(l1);
+    int nxt = 4;
+    float *l2 = step(m, &nxt, 1, 3);
+    tta_adjust(m, l2);
+    return l2;
+}
+
+/* B=0 (fresco o dopo reset): adjust aggiunge zeri esatti, logits identici */
+int qt_tta_lora_off_noop(void) {
+    const char *dir = tst_dir("qwen_tiny_model");
+    qt_write_dense_dir(dir);
+    Model m1; model_init(&m1, dir, 0);
+    tta_setup(TTA_OFF, 0, 0);
+    float *a = qt_tta_two_steps(&m1);
+    Model m2; model_init(&m2, dir, 0);
+    tta_setup(TTA_LORA, 0, 1e-3f);
+    float *b = qt_tta_two_steps(&m2);
+    CHECK(g_tta.alloc && g_tta.lB && g_tta.h_valid);   /* l'adattatore era attivo */
+    for (int v = 0; v < 32; v++) CHECK(a[v] == b[v]);
+    free(a); free(b);
+    tta_setup(TTA_OFF, 0, 0);
+    return 0;
+}
+
+/* osserva sempre il token 7: la P aggiustata di 7 deve crescere vs base */
+int qt_tta_lora_direction(void) {
+    const char *dir = tst_dir("qwen_tiny_model");
+    qt_write_dense_dir(dir);
+    static const int seq[12] = {7,7,7,7,7,7,7,7,7,7,7,7};
+    double p_off, p_on;
+    Model m1; model_init(&m1, dir, 0);
+    tta_setup(TTA_OFF, 0, 0);
+    tta_drive(&m1, seq, 12, &p_off);
+    Model m2; model_init(&m2, dir, 0);
+    tta_setup(TTA_LORA, 0, 0.1f);      /* lr alto per un effetto netto sul tiny */
+    tta_drive(&m2, seq, 12, &p_on);
+    fprintf(stderr, "tta lora: P(next) off=%.4f on=%.4f\n", p_off, p_on);
+    CHECK(p_on > p_off);
+    tta_setup(TTA_OFF, 0, 0);
+    return 0;
+}
+
+/* state_reset azzera B: l'output aggiustato torna identico al base */
+int qt_tta_lora_reset(void) {
+    const char *dir = tst_dir("qwen_tiny_model");
+    qt_write_dense_dir(dir);
+    Model m1; model_init(&m1, dir, 0);
+    tta_setup(TTA_OFF, 0, 0);
+    float *a = qt_tta_two_steps(&m1);
+    Model m2; model_init(&m2, dir, 0);
+    tta_setup(TTA_LORA, 0, 0.1f);
+    static const int seq[10] = {7,7,7,7,7,7,7,7,7,7};
+    tta_drive(&m2, seq, 10, NULL);     /* addestra l'adattatore online */
+    double bnorm = 0;
+    for (int64_t i = 0; i < (int64_t)32*g_tta.lr_rank; i++) bnorm += fabs(g_tta.lB[i]);
+    CHECK(bnorm > 0);                  /* B si e' mosso davvero */
+    state_reset(&m2);                  /* B azzerato -> adattatore no-op */
+    m2.kv_len = 0;
+    float *b = qt_tta_two_steps(&m2);
+    for (int v = 0; v < 32; v++) CHECK(a[v] == b[v]);
+    free(a); free(b);
+    tta_setup(TTA_OFF, 0, 0);
+    return 0;
+}
+
 int qt_tta_ppl_proxy(void) {
     const char *dir = tst_dir("qwen_tiny_model");
     qt_write_dense_dir(dir);

@@ -223,3 +223,21 @@ the probability of a continuation seen earlier in the sequence; on a
 synthetic repetitive sequence the second-half cumulative −log p strictly
 improves with the cache on — the self-supervised win, measurable without a
 real checkpoint.
+
+### `TTA=lora`: the §2.5.2 demonstrator, implemented after all
+
+The rank-r lm_head adapter rejected above for the *default* path is now
+implemented as a third mode, `TTA=lora` — the LoRA runtime and trainer
+(`c/qwen_train.h`) made the machinery cheap to reuse. It keeps a rank-r
+adapter `logits += (α/r)·B·(A·h)` with A[r,D] a fixed random projection
+(deterministic init, α = 2r) and B[V,r] starting at zero, so a fresh
+adapter is an exact no-op. On each observed token it runs closed-form SGD
+on the CE gradient g = p − e_x: `B ← B − η·(α/r)·g⊗t` and
+`A ← A − η·(α/r)·(Bᵀg)⊗h`, with t = A·h stashed from the adjust step and
+Bᵀg computed *before* B moves. Cost per token: O(V·r) — the concern that
+motivated the original rejection stands, which is why it remains opt-in.
+Envs: `TTA=lora`, `TTA_RANK` (default 4, capped at 64), `TTA_LR` (default
+1e-3 in this mode). `state_reset` zeroes B (adapter back to no-op; the
+random A survives), same lifecycle as cache and bias. Tests enforce:
+fresh/reset adapter leaves logits bit-identical; on a repeated token the
+adjusted probability grows past the base model's.

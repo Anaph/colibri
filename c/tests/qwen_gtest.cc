@@ -29,6 +29,9 @@ int qt_tta_off_bitexact(void);
 int qt_tta_cache_boost(void);
 int qt_tta_bias_direction(void);
 int qt_tta_ppl_proxy(void);
+int qt_tta_lora_off_noop(void);
+int qt_tta_lora_direction(void);
+int qt_tta_lora_reset(void);
 }
 
 #define C_TEST(suite, name, fn) \
@@ -61,3 +64,6 @@ C_TEST(QwenTta,      OffBitExact,         qt_tta_off_bitexact)
 C_TEST(QwenTta,      CacheBoost,          qt_tta_cache_boost)
 C_TEST(QwenTta,      BiasDirection,       qt_tta_bias_direction)
 C_TEST(QwenTta,      PplProxy,            qt_tta_ppl_proxy)
+C_TEST(QwenTta,      LoraZeroBNoop,       qt_tta_lora_off_noop)
+C_TEST(QwenTta,      LoraDirection,       qt_tta_lora_direction)
+C_TEST(QwenTta,      LoraReset,           qt_tta_lora_reset)

@@ -85,8 +85,15 @@ Common environment variables (qwen engine):
 | `MEM_FRAC` | — | same budget as a fraction (0..1) of total physical RAM; `MEM_GB` wins |
 | `REF` | — | ref.json with prompt_ids/full_ids for greedy validation |
 | `TOKENS` | 0 | 1 → dump generated token ids to stderr |
-| `TTA` | off | **experimental** test-time adaptation: `cache` (neural cache) or `bias` (online logit bias); see [docs/online-learning.md](docs/online-learning.md) |
-| `TTA_N` / `TTA_LAMBDA` / `TTA_THETA` / `TTA_LR` | 2048 / 0.1 / 1.0 / 0.1 | cache size, mix weight (capped at 0.5), similarity temperature, bias learning rate |
+| `TTA` | off | **experimental** test-time adaptation: `cache` (neural cache), `bias` (online logit bias) or `lora` (online low-rank lm_head adapter); see [docs/online-learning.md](docs/online-learning.md) |
+| `TTA_N` / `TTA_LAMBDA` / `TTA_THETA` / `TTA_LR` | 2048 / 0.1 / 1.0 / 0.1 | cache size, mix weight (capped at 0.5), similarity temperature, bias/lora learning rate (lora defaults to 1e-3) |
+| `TTA_RANK` | 4 | rank of the `TTA=lora` online adapter (capped at 64) |
+| `LORA` | — | safetensors file (or dir) with LoRA adapters to load at startup (qwen only) |
+| `TRAIN` | — | corpus.txt → run the LoRA fine-tuner instead of generating (qwen only, see below) |
+| `TRAIN_CTX` / `TRAIN_STRIDE` / `TRAIN_EPOCHS` | 512 / CTX / 1 | training window, window stride, epochs |
+| `TRAIN_LR` / `TRAIN_WD` / `TRAIN_CE_CHUNK` | 1e-4 / 0 / 32 | AdamW learning rate, weight decay, CE chunk size |
+| `LORA_RANK` / `LORA_ALPHA` / `LORA_LAYERS` / `LORA_HEAD` | 8 / 2·rank / 4 / 0 | adapter rank, scale, how many top layers to adapt, train an lm_head adapter too |
+| `LORA_OUT` | lora.safetensors | where the trainer saves the adapters |
 
 `TTA` (qwen only, default off — zero cost when unset) adapts predictions to
 the text being generated: the neural cache mixes in a distribution over
@@ -105,6 +112,29 @@ state always stay resident) and re-reads the remaining layers from the
 safetensors on every step, prefetching the next layer while the current one
 computes. Streamed layers always run f32 (`QBITS` applies to resident layers
 only); token output is identical at any budget. Unset → everything resident.
+
+## Fine-tuning (LoRA)
+
+The qwen engine ships a dependency-free LoRA fine-tuner (hand-written
+backward pass + AdamW, `c/qwen_train.h`). Set `TRAIN=` to a plain-text
+corpus and the binary trains rank-r adapters on the top `LORA_LAYERS`
+layers (q/k/v/o + gate/up/down, optionally the lm_head) instead of
+generating, then saves them as a single safetensors file:
+
+```bash
+TRAIN=corpus.txt SNAP=$SNAP/Qwen3-0.6B/snapshots/<hash> \
+  LORA_LAYERS=4 LORA_RANK=8 TRAIN_EPOCHS=2 ./c/qwen
+LORA=lora.safetensors SNAP=$SNAP/Qwen3-0.6B/snapshots/<hash> ./c/qwen
+```
+
+Training v1 requires a dense Qwen3 checkpoint, f32 weights (`QBITS=0`) and
+everything resident (no `MEM_GB`). Setting `LORA=` during training warm
+starts from previously saved adapters; at inference `LORA=` works with any
+mode (chat, `PROMPT`, `REF`) and quantization, and adapters with all-zero
+B matrices are exact no-ops. Every adapter tensor in the file must match a
+known name and shape or the engine refuses to start. The backward pass is
+verified by a finite-difference gradient check over every adapter
+parameter (`qt_grad_fd`).
 
 ## Qwen engine notes
 
