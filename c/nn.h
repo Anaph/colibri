@@ -27,8 +27,14 @@ static inline int  omp_get_thread_num(void)  { return 0; }
 static inline void omp_set_num_threads(int n) { (void)n; }
 #endif
 
-/* peso denso: f32 oppure int8+scala per riga (QBITS=8) */
-typedef struct { float *f; int8_t *q; float *qs; int O, I; } Mat;
+/* peso denso: f32, int8+scala per riga (QBITS=8), oppure STREAMATO dal disco
+ * (micro-RSS: f/q NULL, sh/sname puntano al descrittore safetensors; il
+ * matmul legge le righe a blocchi e non tiene nulla residente). nn.h non
+ * conosce st.h: il dispatch passa per il puntatore g_mat_stream_fn, che
+ * runtime.h installa quando attiva il micro-RSS. */
+typedef struct Mat { float *f; int8_t *q; float *qs; int O, I;
+                     const void *sh; const char *sname; } Mat;
+static void (*g_mat_stream_fn)(float *y, const float *x, const struct Mat *w, int S) = NULL;
 
 /* tetto sulla riga di attivazione quantizzabile al volo in matmul_q */
 #define NN_QROW_MAX 16384
@@ -125,6 +131,7 @@ static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I,
 
 /* y[S,O] = x[S,I] @ W^T qualunque sia lo storage del peso */
 static void mat_apply(float *y, const float *x, const Mat *w, int S) {
+    if (g_mat_stream_fn && w->sh) { g_mat_stream_fn(y, x, w, S); return; }
     if (w->q) matmul_q_s(y, x, w->q, w->qs, S, w->I, w->O);
     else matmul(y, x, w->f, S, w->I, w->O);
 }

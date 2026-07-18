@@ -83,6 +83,8 @@ Common environment variables (qwen engine):
 | `THREADS` | — | cap the OpenMP team; overrides `OMP_NUM_THREADS`; applied before load |
 | `MEM_GB` | — | RAM budget in GiB: layers beyond the budget stream from disk each step |
 | `MEM_FRAC` | — | same budget as a fraction (0..1) of total physical RAM; `MEM_GB` wins |
+| `MICRO` | 0 | 1 → micro-RSS mode (qwen only): **no** weights resident, minimum possible RAM; see below |
+| `MICRO_DROP` | 1 | 0 → let streamed weight pages live in the OS page cache (faster, more memory charged to the process's cgroup) |
 | `REF` | — | ref.json with prompt_ids/full_ids for greedy validation |
 | `TOKENS` | 0 | 1 → dump generated token ids to stderr |
 | `TTA` | off | **experimental** test-time adaptation: `cache` (neural cache), `bias` (online logit bias) or `lora` (online low-rank lm_head adapter); see [docs/online-learning.md](docs/online-learning.md) |
@@ -112,6 +114,22 @@ state always stay resident) and re-reads the remaining layers from the
 safetensors on every step, prefetching the next layer while the current one
 computes. Streamed layers always run f32 (`QBITS` applies to resident layers
 only); token output is identical at any budget. Unset → everything resident.
+The classic path never goes below embeddings-f32 + one layer of scratch; if
+your budget is under that floor the engine tells you to use `MICRO=1`.
+
+`MICRO=1` (qwen only) is the mode for **hard** memory limits (cgroup,
+embedded): nothing of the model stays resident. Embedding rows are gathered
+from disk per token, every matmul re-reads its matrix in constant-size 4 MB
+chunks, and the lm_head streams the same way; with the default `MICRO_DROP=1`
+each chunk is evicted from the page cache right after use, so the footprint
+is only activations + KV cache + tokenizer. The context default drops to 256
+(`CTX` still wins) because the KV cache is the last big allocation. Token
+output is bit-identical to the resident f32 path. The price is honest: the
+whole model transits from disk on *every* token, so decode speed is disk
+bandwidth divided by model size (~1–3 s/token for a 4B model on NVMe).
+Ballpark RSS: Qwen3-0.6B ≈ 100–150 MB, 4B ≈ 150–250 MB, dominated by KV and
+tokenizer, not weights. Incompatible with `TRAIN` (which needs resident f32
+weights); `LORA` adapters work (they are small and stay resident).
 
 ## Fine-tuning (LoRA)
 

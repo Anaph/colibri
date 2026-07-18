@@ -460,7 +460,11 @@ int qt_memknob_parity(void) {
     /* stessi id greedy con: tutto residente (budget 0), tutto streamato
      * (budget minuscolo -> R=0) e budget enorme (R=n_layers) — sia sul
      * modello denso che sull'ibrido (stati deltanet sempre residenti) */
-    const char *dirs[2] = { tst_dir("qwen_tiny_model"), tst_dir("qwen_tiny_hybrid") };
+    /* tst_dir ritorna un buffer statico: copie locali obbligatorie */
+    char dense[512], hyb[512];
+    snprintf(dense, sizeof(dense), "%s", tst_dir("qwen_tiny_model"));
+    snprintf(hyb,   sizeof(hyb),   "%s", tst_dir("qwen_tiny_hybrid"));
+    const char *dirs[2] = { dense, hyb };
     qt_write_dense_dir(dirs[0]);
     qt_write_hybrid_dir(dirs[1]);
     for (int d = 0; d < 2; d++) {
@@ -482,6 +486,50 @@ int qt_memknob_env(void) {
     CHECK(budget_from_env(NULL, NULL, g8) == 0);
     CHECK(budget_from_env("0", "1.5", g8) == 0);                /* valori invalidi -> residente */
     CHECK(budget_from_env("0.5", NULL, g8) == (int64_t)512<<20);
+    return 0;
+}
+
+/* ---- micro-RSS: embed non residente + matmul streamato, parita' bit-esatta
+ * col percorso f32 residente (stesse righe, stesso dot_f32) ---- */
+static int qt_run8_micro(const char *dir, int *out) {
+    g_micro = 1; g_micro_chunk = 256;   /* blocchi minuscoli: esercita il loop di chunking */
+    Model m;
+    model_init_ex(&m, dir, 0, 0, 16);
+    CHECK(m.embed == NULL);
+    CHECK(m.n_resident == 0);
+    CHECK(m.stream_buf == NULL);
+    CHECK(m.lm_tied && m.lm_head.sh != NULL && m.lm_head.f == NULL);
+    kv_alloc(&m, 16);
+    int prompt[3] = {1,2,3};
+    memcpy(out, prompt, sizeof(prompt));
+    float *logit = step(&m, prompt, 3, 0);
+    int len = 3;
+    for (int s = 0; s < 8; s++) {
+        for (int i = 0; i < m.c.vocab; i++) CHECK(isfinite(logit[i]));
+        int best = argmax_v(logit, m.c.vocab);
+        free(logit);
+        out[len++] = best;
+        if (s == 7) break;
+        logit = step(&m, &out[len-1], 1, len-1);
+    }
+    g_micro = 0; g_mat_stream_fn = NULL; g_micro_chunk = 4<<20;
+    return 0;
+}
+
+int qt_micro_parity(void) {
+    /* tst_dir ritorna un buffer statico: copie locali obbligatorie */
+    char dense[512], hyb[512];
+    snprintf(dense, sizeof(dense), "%s", tst_dir("qwen_tiny_model"));
+    snprintf(hyb,   sizeof(hyb),   "%s", tst_dir("qwen_tiny_hybrid"));
+    const char *dirs[2] = { dense, hyb };
+    qt_write_dense_dir(dirs[0]);
+    qt_write_hybrid_dir(dirs[1]);
+    for (int d = 0; d < 2; d++) {
+        int a[16], b[16];
+        CHECK(qt_run8(dirs[d], 0, d, a) == 0);
+        CHECK(qt_run8_micro(dirs[d], b) == 0);
+        for (int i = 0; i < 11; i++) CHECK(a[i] == b[i]);
+    }
     return 0;
 }
 

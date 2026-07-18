@@ -71,6 +71,13 @@ Container: 4 shared cores, AVX512-VNNI, portable-build kernels for the table
    batched `mlp()` removes S× region re-forks per layer on top.
 5. **DeltaNet single region**: conv + recurrence share one parallel region
    per token (was two). Minor; taken because it is free.
+6. **Micro-RSS mode** (`MICRO=1`, qwen) — the opposite trade: minimum
+   resident memory instead of maximum speed. No weight is resident (embedding
+   rows gathered per token, every GEMV re-reads its matrix in constant 4 MB
+   chunks, page cache dropped after use); output stays bit-identical to the
+   resident f32 path. Decode cost becomes *disk* bandwidth ÷ model bytes —
+   the same wall as §1 with the disk in place of RAM. For hard cgroup /
+   embedded limits where tok/s is secondary.
 
 ## 3. Deferred optimizations, cost/benefit at 4B
 

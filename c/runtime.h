@@ -40,6 +40,12 @@ static void banner(Model *m);
 #ifndef ENGINE_POST_INIT
 #define ENGINE_POST_INIT(m) ((void)0)
 #endif
+/* il motore dichiara ENGINE_MICRO 1 se il suo step() sa girare senza embed
+ * residente (gather per riga dal disco). Senza dichiarazione MICRO=1 fallisce
+ * rumorosamente invece di crashare su embed NULL. */
+#ifndef ENGINE_MICRO
+#define ENGINE_MICRO 0
+#endif
 
 /* ---------- config: range check ---------- */
 #define CKR(name, v, lo, hi) do { long _v=(long)(v); if(_v<(lo)||_v>(hi)){ \
@@ -101,7 +107,7 @@ static float *load_t(Model *m, const char *name, int64_t expect) {
 
 /* carica [O,I]; con QBITS=8 tiene solo int8+scala e libera l'f32 */
 static void load_mat(Model *m, Mat *w, const char *name, int O, int I) {
-    w->O = O; w->I = I; w->q = NULL; w->qs = NULL;
+    w->O = O; w->I = I; w->q = NULL; w->qs = NULL; w->sh = NULL; w->sname = NULL;
     w->f = load_t(m, name, (int64_t)O*I);
     if (m->qbits == 8) {
         w->q = malloc((int64_t)O*I); w->qs = falloc(O);
@@ -125,7 +131,7 @@ static void layer_stream_in(Model *m, int li) {
     for (int j = 0; j < n; j++) {
         st_read_f32(&m->S, r[j].name, m->stream_buf + off, 0);  /* drop=0: la page cache aiuta */
         r[j].mat->f = m->stream_buf + off;
-        r[j].mat->q = NULL; r[j].mat->qs = NULL;
+        r[j].mat->q = NULL; r[j].mat->qs = NULL; r[j].mat->sh = NULL;
         r[j].mat->O = r[j].O; r[j].mat->I = r[j].I;
         off += (int64_t)r[j].O*r[j].I;
     }
@@ -140,6 +146,58 @@ static void layer_prefetch(Model *m, int li) {
 #endif
 }
 
+/* ---------- micro-RSS (MICRO=1): consumo di RAM minimo assoluto ----------
+ * NESSUN peso resta residente: l'embedding si legge per riga (gather nello
+ * step del motore), ogni matmul rilegge la propria matrice dal disco a blocchi
+ * di g_micro_chunk byte in uno scratch costante. Con g_micro_drop=1 (default)
+ * ogni blocco viene anche scartato dalla page cache subito dopo l'uso: il
+ * footprint e' davvero solo attivazioni + KV + tokenizer, pensato per limiti
+ * HARD (cgroup/embedded). Prezzo: l'intero modello transita dal disco a OGNI
+ * token — la velocita' e' bandwidth-del-disco, non della RAM. */
+static int     g_micro = 0;             /* attivato da MICRO=1 (engine_main) o dai test */
+static int     g_micro_drop = 1;        /* MICRO_DROP=0 -> lascia vivere la page cache */
+static int64_t g_micro_chunk = 4 << 20; /* byte f32 dello scratch di streaming */
+
+/* y[S,O] = x[S,I] @ W^T leggendo W dal disco a blocchi di righe; installata in
+ * g_mat_stream_fn cosi' mat_apply (nn.h) la usa per le Mat con sh!=NULL.
+ * Scratch statico che cresce e basta: contratto di chiamata SERIALE, come
+ * matmul_q_s. Bit-identica al percorso f32 residente (stesse righe, stesso
+ * dot_f32). */
+static void mat_stream(float *y, const float *x, const Mat *w, int S) {
+    shards *Sh = (shards *)w->sh;
+    int I = w->I, O = w->O;
+    int rows = (int)(g_micro_chunk / ((int64_t)I * 4));
+    if (rows < 1) rows = 1;
+    if (rows > O) rows = O;
+    static float *buf = NULL; static int64_t cap = 0;
+    if ((int64_t)rows * I > cap) {
+        cap = (int64_t)rows * I;
+        buf = realloc(buf, cap * sizeof(float));
+        if (!buf) { fprintf(stderr, "OOM micro scratch %ld\n", (long)cap); exit(1); }
+    }
+    for (int o0 = 0; o0 < O; o0 += rows) {
+        int r = O - o0 < rows ? O - o0 : rows;
+        st_read_slice_f32(Sh, w->sname, (int64_t)o0 * I, (int64_t)r * I, buf, g_micro_drop);
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < r; o++)
+            for (int s = 0; s < S; s++)
+                y[(int64_t)s*O + o0 + o] = dot_f32(x + (int64_t)s*I, buf + (int64_t)o*I, I);
+    }
+}
+
+/* prepara una Mat streamata: dims validate contro il file, nessun dato letto */
+static void mat_stream_init(Model *m, Mat *w, const char *name, int O, int I) {
+    int64_t have = st_numel(&m->S, name);
+    if (have != (int64_t)O*I) {
+        fprintf(stderr, "tensor %s: numel %lld != atteso %lld\n",
+                name, (long long)have, (long long)((int64_t)O*I));
+        exit(1);
+    }
+    w->f = NULL; w->q = NULL; w->qs = NULL;
+    w->O = O; w->I = I;
+    w->sh = &m->S; w->sname = strdup(name);
+}
+
 /* budget_bytes==0 -> tutto residente (comportamento classico) */
 static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_bytes, int ctx_hint) {
     memset(m, 0, sizeof(*m));
@@ -149,22 +207,44 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
     Cfg *c = &m->c;
     double t0 = now_s();
     int D = c->hidden;
-    m->embed      = load_t(m, "model.embed_tokens.weight", (int64_t)c->vocab*D);
     m->final_norm = load_t(m, "model.norm.weight", D);
-    if (c->tie_emb || !st_has(&m->S, "lm_head.weight")) {
-        m->lm_tied = 1;
+    m->lm_tied = c->tie_emb || !st_has(&m->S, "lm_head.weight");
+    m->L = calloc(c->n_layers, sizeof(Layer));
+    /* 1) parte piccola SEMPRE residente (hook: norme, vettori, stati, PLE...) */
+    load_small(m);
+    int64_t max_lb = 0;
+    for (int i = 0; i < c->n_layers; i++) { int64_t b = layer_f32_bytes(m, i); if (b > max_lb) max_lb = b; }
+    /* micro-RSS: nessun peso residente, embed compreso (gather per riga nello
+     * step del motore); ogni Mat diventa un descrittore streamato. */
+    if (g_micro) {
+#if ENGINE_MICRO
+        g_mat_stream_fn = mat_stream;
+        mat_stream_init(m, &m->lm_head,
+                        m->lm_tied ? "model.embed_tokens.weight" : "lm_head.weight", c->vocab, D);
+        for (int i = 0; i < c->n_layers; i++) {
+            MatRef r[MAX_LAYER_MATS]; int n = layer_matrefs(m, i, r);
+            for (int j = 0; j < n; j++) mat_stream_init(m, r[j].mat, r[j].name, r[j].O, r[j].I);
+        }
+        m->n_resident = 0;                    /* verita': zero layer residenti */
+        m->load_s = now_s() - t0;
+        fprintf(stderr, "[" ENGINE_TAG "] micro-RSS: 0 pesi residenti, matmul streamato a blocchi da %lld MB, page cache %s\n",
+                (long long)(g_micro_chunk >> 20), g_micro_drop ? "scartata (MICRO_DROP=0 per tenerla)" : "attiva");
+        return;
+#else
+        fprintf(stderr, "[" ENGINE_TAG "] MICRO=1 non supportato da questo motore\n");
+        exit(1);
+#endif
+    }
+    m->embed = load_t(m, "model.embed_tokens.weight", (int64_t)c->vocab*D);
+    if (m->lm_tied) {
         m->lm_head.f = m->embed; m->lm_head.q=NULL; m->lm_head.qs=NULL;
+        m->lm_head.sh=NULL; m->lm_head.sname=NULL;
         m->lm_head.O = c->vocab; m->lm_head.I = D;
     } else {
         load_mat(m, &m->lm_head, "lm_head.weight", c->vocab, D);
     }
-    m->L = calloc(c->n_layers, sizeof(Layer));
-    /* 1) parte piccola SEMPRE residente (hook: norme, vettori, stati, PLE...) */
-    load_small(m);
     /* 2) budget -> quanti layer di matrici stanno residenti */
     m->n_resident = c->n_layers;
-    int64_t max_lb = 0;
-    for (int i = 0; i < c->n_layers; i++) { int64_t b = layer_f32_bytes(m, i); if (b > max_lb) max_lb = b; }
     if (budget_bytes > 0) {
         int64_t fixed = ((int64_t)c->vocab*D + D)*4;                /* embed + final_norm */
         if (!m->lm_tied) fixed += (int64_t)c->vocab*D*4;
@@ -181,6 +261,12 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
         m->n_resident = R;
         fprintf(stderr, "[" ENGINE_TAG "] budget %.2f GB -> %d/%d layer residenti (fisso %.2f GB, scratch %.2f GB)\n",
                 budget_bytes/1073741824.0, R, c->n_layers, fixed/1073741824.0, max_lb/1073741824.0);
+#if ENGINE_MICRO
+        /* il classico non scende sotto embed f32 + scratch: budget irrealizzabile */
+        if (budget_bytes < fixed + max_lb)
+            fprintf(stderr, "[" ENGINE_TAG "] budget sotto il pavimento residente (%.2f GB): per la RSS minima usa MICRO=1\n",
+                    (fixed + max_lb)/1073741824.0);
+#endif
     }
     /* 3) matrici: residenti (QBITS onorato) o streamate (dims impostate, f=NULL) */
     for (int i = 0; i < c->n_layers; i++) {
@@ -342,7 +428,13 @@ static int engine_main(int argc, char **argv) {
     int qbits = getenv("QBITS") ? atoi(getenv("QBITS")) : 0;
     if (qbits != 0 && qbits != 8) { fprintf(stderr, "QBITS deve essere 0 (f32) o 8 (int8)\n"); return 1; }
     int ngen  = getenv("NGEN") ? atoi(getenv("NGEN")) : 256;
-    int maxctx= getenv("CTX")  ? atoi(getenv("CTX"))  : 4096;
+    /* MICRO=1: micro-RSS. La KV-cache resta l'unica voce grande -> il default
+     * di contesto scende a 256 (CTX esplicito vince sempre). */
+    const char *mi_ = getenv("MICRO");
+    g_micro = mi_ && atoi(mi_) > 0;
+    const char *md_ = getenv("MICRO_DROP");
+    if (md_ && *md_) g_micro_drop = atoi(md_) != 0;
+    int maxctx= getenv("CTX")  ? atoi(getenv("CTX"))  : (g_micro ? 256 : 4096);
     if (getenv("TEMP"))    g_temp = (float)atof(getenv("TEMP"));
     if (getenv("NUCLEUS")) g_nuc  = (float)atof(getenv("NUCLEUS"));
     if (getenv("SEED"))    g_rng  = (uint64_t)strtoull(getenv("SEED"),NULL,10) | 1u;

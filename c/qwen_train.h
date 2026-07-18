@@ -402,7 +402,7 @@ static double train_loss_and_backward(Model *m, const int *ids, int S, int L0,
 static void train_guard(Model *m, int L0) {
     if (m->qbits != 0) { fprintf(stderr, "[train] richiede pesi f32 (QBITS=0)\n"); exit(1); }
     if (m->c.hybrid)   { fprintf(stderr, "[train] training v1: solo modelli Qwen3 densi (niente layer deltanet)\n"); exit(1); }
-    if (m->n_resident != m->c.n_layers) { fprintf(stderr, "[train] richiede tutti i layer residenti (niente MEM_GB/MEM_FRAC)\n"); exit(1); }
+    if (m->n_resident != m->c.n_layers) { fprintf(stderr, "[train] richiede tutti i layer residenti (niente MEM_GB/MEM_FRAC/MICRO)\n"); exit(1); }
     for (int i = L0; i < m->c.n_layers; i++)
         if (m->L[i].gated) { fprintf(stderr, "[train] layer %d gated: non supportato nel range addestrato\n", i); exit(1); }
 }
@@ -455,7 +455,10 @@ static void lora_train_alloc(Model *m, int L0, int r, float alpha, int head) {
 
 /* gradienti: struttura speculare agli adattatori, azzerata */
 static LoraLayer *lora_grad_alloc(Model *m, int L0, Lora *gHead) {
-    LoraLayer *gL = calloc(m->c.n_layers - L0, sizeof(LoraLayer));
+    /* L0 <= n_layers per costruzione (train_main clampa); il max tiene il
+     * range non-negativo visibile al compilatore */
+    int nl = m->c.n_layers - L0; if (nl < 1) nl = 1;
+    LoraLayer *gL = calloc(nl, sizeof(LoraLayer));
     for (int i = L0; i < m->c.n_layers; i++) {
         Layer *l = &m->L[i]; LoraLayer *gg = &gL[i - L0];
         #define GF(fld, sub, I_, O_) do { if (l->lo && l->lo->fld.r) { \

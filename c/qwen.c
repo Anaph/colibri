@@ -9,6 +9,8 @@
  *   TEMP=0.7 NUCLEUS=0.95 SEED=n      sampling (TEMP=0 -> greedy)
  *   CHAT_TEMPLATE=1 THINK=0           template chat Qwen3 (<|im_start|>...); THINK=0 chiude il blocco think
  *   QBITS=8                           quantizza i pesi grandi a int8 al load (~4x meno RAM)
+ *   MICRO=1                           micro-RSS: NESSUN peso residente, tutto streamato dal disco
+ *                                     (MICRO_DROP=0 per lasciare vivere la page cache)
  *   REF=ref.json                      validazione: greedy sui prompt_ids, confronto con full_ids
  *   TOKENS=1                          dump degli id generati su stderr
  */
@@ -101,6 +103,7 @@ static void lora_load(Model *m);
 #define ENGINE_LOGITS_HOOK(m, lo) tta_adjust((m), (lo))
 #define ENGINE_OBSERVE(m, tok)    tta_observe((m), (tok))
 #define ENGINE_POST_INIT(m)       lora_load(m)
+#define ENGINE_MICRO 1            /* step() sa girare con embed NULL (gather per riga) */
 
 #include "runtime.h"
 
@@ -696,12 +699,19 @@ static void mlp(Model *m, Layer *l, float *x, int S, float *out) {
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     float *x = falloc((int64_t)S*D);
-    for (int s = 0; s < S; s++) memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
+    for (int s = 0; s < S; s++) {
+        if (m->embed)                              /* micro-RSS: embed NON residente */
+            memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
+        else                                       /* gather della sola riga richiesta (drop=0: righe calde minuscole) */
+            st_read_slice_f32(&m->S, "model.embed_tokens.weight", (int64_t)ids[s]*D, D, x + (int64_t)s*D, 0);
+    }
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
-    if (m->n_resident < c->n_layers) layer_prefetch(m, m->n_resident);
+    /* stream_buf esiste solo nel percorso MEM_GB classico; in micro-RSS lo
+     * streaming avviene DENTRO mat_apply, matrice per matrice */
+    if (m->stream_buf && m->n_resident < c->n_layers) layer_prefetch(m, m->n_resident);
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
-        if (i >= m->n_resident) {
+        if (m->stream_buf && i >= m->n_resident) {
             layer_stream_in(m, i);                  /* rilegge il layer dal disco (f32) */
             if (i + 1 < c->n_layers && i + 1 >= m->n_resident) layer_prefetch(m, i + 1);
         }

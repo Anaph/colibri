@@ -268,6 +268,7 @@ static void st_read_raw(shards *S, const char *name, void *out, int drop) {
 static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int64_t n_elems, float *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (t->dtype == 3) { fprintf(stderr, "tensor %s: slice read su dtype U8 non supportata\n", name); exit(1); }
     int esz = (t->dtype == 2) ? 4 : 2;
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
     void *raw = malloc(nb);
