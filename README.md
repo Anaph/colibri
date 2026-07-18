@@ -84,6 +84,14 @@ Common environment variables (qwen engine):
 | `MEM_FRAC` | — | same budget as a fraction (0..1) of total physical RAM; `MEM_GB` wins |
 | `REF` | — | ref.json with prompt_ids/full_ids for greedy validation |
 | `TOKENS` | 0 | 1 → dump generated token ids to stderr |
+| `TTA` | off | **experimental** test-time adaptation: `cache` (neural cache) or `bias` (online logit bias); see [docs/online-learning.md](docs/online-learning.md) |
+| `TTA_N` / `TTA_LAMBDA` / `TTA_THETA` / `TTA_LR` | 2048 / 0.1 / 1.0 / 0.1 | cache size, mix weight (capped at 0.5), similarity temperature, bias learning rate |
+
+`TTA` (qwen only, default off — zero cost when unset) adapts predictions to
+the text being generated: the neural cache mixes in a distribution over
+recently seen continuations, the bias variant runs closed-form SGD on a
+persistent logit bias. Adaptation state is cleared on every context reset
+and REF validation mode structurally bypasses it.
 
 `MEM_GB`/`MEM_FRAC` (qwen and gemma) trade speed for memory: the engine keeps
 as many layers resident as fit the budget (embeddings, norms and recurrent

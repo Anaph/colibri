@@ -468,3 +468,101 @@ int qt_memknob_env(void) {
     CHECK(budget_from_env("0.5", NULL, g8) == (int64_t)512<<20);
     return 0;
 }
+
+/* ---- TTA sperimentale: cache neurale e bias sui logit ---- */
+
+/* protocollo di gen_turn guidato a mano: step -> adjust -> (prob del vero
+ * successivo) -> observe. Ritorna la somma di -log p(next) su seq[1..n). */
+static double tta_drive(Model *m, const int *seq, int n, double *last_p_next) {
+    kv_alloc(m, 32);
+    double nll = 0;
+    float *logit = NULL;
+    for (int t = 0; t < n - 1; t++) {
+        logit = step(m, &seq[t], 1, t);
+        tta_adjust(m, logit);
+        float *p = falloc(m->c.vocab);
+        memcpy(p, logit, m->c.vocab*sizeof(float));
+        softmax_row(p, m->c.vocab);
+        nll += -log((double)p[seq[t+1]] + 1e-30);
+        if (last_p_next) *last_p_next = p[seq[t+1]];
+        free(p);
+        tta_observe(m, seq[t+1]);
+        free(logit);
+    }
+    return nll;
+}
+
+static void tta_setup(int mode, float lambda, float lr) {
+    tta_reset();
+    g_tta.init = 1;                 /* niente parsing env nei test */
+    g_tta.mode = mode;
+    g_tta.n = 64; g_tta.lambda = lambda; g_tta.theta = 4.0f; g_tta.lr = lr;
+    g_tta.alloc = 0;                /* ri-alloca alle dimensioni del modello corrente */
+}
+
+int qt_tta_off_bitexact(void) {
+    const char *dir = tst_dir("qwen_tiny_model");
+    qt_write_dense_dir(dir);
+    static const int seq[8] = {1,2,3,1,2,3,1,2};
+    Model m1; model_init(&m1, dir, 0);
+    tta_setup(TTA_OFF, 0, 0);
+    double a = tta_drive(&m1, seq, 8, NULL);
+    /* cache con lambda=0 deve essere identico a spento */
+    Model m2; model_init(&m2, dir, 0);
+    tta_setup(TTA_CACHE, 0.0f, 0);
+    double b = tta_drive(&m2, seq, 8, NULL);
+    CHECK(a == b);
+    return 0;
+}
+
+int qt_tta_cache_boost(void) {
+    const char *dir = tst_dir("qwen_tiny_model");
+    qt_write_dense_dir(dir);
+    /* sequenza ripetitiva: il cache deve alzare P del prossimo token ripetuto */
+    static const int seq[13] = {4,5,6,4,5,6,4,5,6,4,5,6,4};
+    double p_off, p_on;
+    Model m1; model_init(&m1, dir, 0);
+    tta_setup(TTA_OFF, 0, 0);
+    tta_drive(&m1, seq, 13, &p_off);
+    Model m2; model_init(&m2, dir, 0);
+    tta_setup(TTA_CACHE, 0.3f, 0);
+    tta_drive(&m2, seq, 13, &p_on);
+    fprintf(stderr, "tta cache: P(next) off=%.4f on=%.4f\n", p_off, p_on);
+    CHECK(p_on > p_off);
+    return 0;
+}
+
+int qt_tta_bias_direction(void) {
+    const char *dir = tst_dir("qwen_tiny_model");
+    qt_write_dense_dir(dir);
+    /* osserva sempre il token 7: il bias deve crescere su 7 */
+    static const int seq[10] = {7,7,7,7,7,7,7,7,7,7};
+    Model m; model_init(&m, dir, 0);
+    tta_setup(TTA_BIAS, 0, 0.5f);
+    tta_drive(&m, seq, 10, NULL);
+    CHECK(g_tta.alloc && g_tta.bias[7] > 0.f);
+    for (int v = 0; v < m.c.vocab; v++)
+        if (v != 7) CHECK(g_tta.bias[7] > g_tta.bias[v]);
+    /* reset: il bias torna a zero */
+    state_reset(&m);
+    CHECK(g_tta.bias[7] == 0.f);
+    return 0;
+}
+
+int qt_tta_ppl_proxy(void) {
+    const char *dir = tst_dir("qwen_tiny_model");
+    qt_write_dense_dir(dir);
+    /* su testo ripetitivo la NLL cumulata deve strettamente migliorare */
+    static int seq[25];
+    for (int i = 0; i < 25; i++) seq[i] = 8 + (i % 3);
+    Model m1; model_init(&m1, dir, 0);
+    tta_setup(TTA_OFF, 0, 0);
+    double nll_off = tta_drive(&m1, seq, 25, NULL);
+    Model m2; model_init(&m2, dir, 0);
+    tta_setup(TTA_CACHE, 0.3f, 0);
+    double nll_on = tta_drive(&m2, seq, 25, NULL);
+    fprintf(stderr, "tta ppl-proxy: nll off=%.3f on=%.3f\n", nll_off, nll_on);
+    CHECK(nll_on < nll_off);
+    tta_setup(TTA_OFF, 0, 0);       /* non inquinare gli altri test */
+    return 0;
+}

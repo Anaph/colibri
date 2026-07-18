@@ -83,7 +83,112 @@ typedef struct {
     double load_s;
 } Model;
 
+/* --- TTA sperimentale: adattamento lento a runtime (docs/online-learning.md).
+ * TTA=cache -> neural cache (senza gradienti); TTA=bias -> bias sui logit con
+ * gradiente in forma chiusa. Default SPENTO: gli hook costano un branch. */
+static void tta_adjust(Model *m, float *lo);
+static void tta_observe(Model *m, int tok);
+#define ENGINE_LOGITS_HOOK(m, lo) tta_adjust((m), (lo))
+#define ENGINE_OBSERVE(m, tok)    tta_observe((m), (tok))
+
 #include "runtime.h"
+
+enum { TTA_OFF = 0, TTA_CACHE = 1, TTA_BIAS = 2 };
+static struct {
+    int init, alloc, mode;
+    int n, len, head;           /* ring del cache: capacita', riempimento, prossimo slot */
+    float lr, lambda, theta;
+    float *h;                   /* [n][D] hidden normalizzati */
+    int   *tok;                 /* [n] token osservato dopo h_i */
+    float *h_cur; int h_valid;  /* [D] hidden della predizione corrente (stash di step) */
+    float *bias;                /* [V] (modo bias) */
+    float *p, *pc, *sc;         /* scratch: softmax corrente [V], distr. cache [V], scores [n] */
+    int V, D;                   /* dimensioni al momento dell'alloc */
+} g_tta;
+
+static void tta_ensure(Model *m) {
+    if (!g_tta.init) {
+        g_tta.init = 1;
+        const char *e = getenv("TTA");
+        g_tta.mode = !e || !*e || !strcmp(e,"0") ? TTA_OFF
+                   : !strcmp(e,"cache") ? TTA_CACHE
+                   : !strcmp(e,"bias")  ? TTA_BIAS : TTA_OFF;
+        g_tta.n      = getenv("TTA_N")      ? atoi(getenv("TTA_N"))            : 2048;
+        g_tta.lr     = getenv("TTA_LR")     ? (float)atof(getenv("TTA_LR"))     : 0.1f;
+        g_tta.lambda = getenv("TTA_LAMBDA") ? (float)atof(getenv("TTA_LAMBDA")) : 0.1f;
+        g_tta.theta  = getenv("TTA_THETA")  ? (float)atof(getenv("TTA_THETA"))  : 1.0f;
+        if (g_tta.lambda < 0) g_tta.lambda = 0;
+        if (g_tta.lambda > 0.5f) g_tta.lambda = 0.5f;   /* il cache non puo' dominare */
+        if (g_tta.n < 1) g_tta.n = 1;
+        if (g_tta.mode) fprintf(stderr, "[qwen] TTA sperimentale: %s (n=%d lr=%g lambda=%g theta=%g)\n",
+                                g_tta.mode==TTA_CACHE?"cache":"bias", g_tta.n, g_tta.lr, g_tta.lambda, g_tta.theta);
+    }
+    if (g_tta.mode && !g_tta.alloc) {
+        int V = m->c.vocab, D = m->c.hidden;
+        g_tta.h     = falloc((int64_t)g_tta.n * D);
+        g_tta.tok   = malloc(g_tta.n * sizeof(int));
+        g_tta.h_cur = falloc(D);
+        g_tta.bias  = calloc(V, sizeof(float));
+        g_tta.p     = falloc(V);
+        g_tta.pc    = falloc(V);
+        g_tta.sc    = falloc(g_tta.n);
+        g_tta.V = V; g_tta.D = D;
+        g_tta.alloc = 1;
+    }
+}
+
+static void tta_reset(void) {
+    g_tta.len = 0; g_tta.head = 0; g_tta.h_valid = 0;
+    if (g_tta.alloc) memset(g_tta.bias, 0, g_tta.V*sizeof(float));
+}
+
+/* aggiusta i logits della predizione corrente (chiamato da gen_turn dopo step) */
+static void tta_adjust(Model *m, float *lo) {
+    tta_ensure(m);
+    if (g_tta.mode == TTA_OFF) return;
+    int V = m->c.vocab, D = m->c.hidden;
+    if (g_tta.mode == TTA_BIAS) {
+        for (int v = 0; v < V; v++) lo[v] += g_tta.bias[v];
+        memcpy(g_tta.p, lo, V*sizeof(float));      /* softmax per l'update in observe */
+        softmax_row(g_tta.p, V);
+        return;
+    }
+    /* cache: logits' = log((1-l)*p_model + l*p_cache) */
+    if (!g_tta.h_valid || g_tta.len == 0 || g_tta.lambda <= 0) return;
+    double s2 = 0; for (int d = 0; d < D; d++) s2 += (double)g_tta.h_cur[d]*g_tta.h_cur[d];
+    float r = 1.f/sqrtf((float)s2 + 1e-12f);
+    float *hn = g_tta.pc;                          /* riuso momentaneo dello scratch */
+    for (int d = 0; d < D; d++) hn[d] = g_tta.h_cur[d]*r;
+    for (int i = 0; i < g_tta.len; i++)
+        g_tta.sc[i] = g_tta.theta * dot_f32(hn, g_tta.h + (int64_t)i*D, D);
+    softmax_row(g_tta.sc, g_tta.len);
+    memset(g_tta.pc, 0, V*sizeof(float));
+    for (int i = 0; i < g_tta.len; i++) g_tta.pc[g_tta.tok[i]] += g_tta.sc[i];
+    memcpy(g_tta.p, lo, V*sizeof(float));
+    softmax_row(g_tta.p, V);
+    float om = 1.f - g_tta.lambda;
+    for (int v = 0; v < V; v++) lo[v] = logf(om*g_tta.p[v] + g_tta.lambda*g_tta.pc[v] + 1e-30f);
+}
+
+/* osserva il token successivo fissato (chiamato da gen_turn dopo pick_tok) */
+static void tta_observe(Model *m, int tok) {
+    if (g_tta.mode == TTA_OFF || !g_tta.alloc) return;
+    int V = m->c.vocab, D = m->c.hidden;
+    if (g_tta.mode == TTA_BIAS) {
+        /* SGD esatto sulla CE col bias: b += lr*(e_x - softmax(logit+b)) */
+        for (int v = 0; v < V; v++) g_tta.bias[v] -= g_tta.lr * g_tta.p[v];
+        g_tta.bias[tok] += g_tta.lr;
+        return;
+    }
+    if (!g_tta.h_valid) return;
+    double s2 = 0; for (int d = 0; d < D; d++) s2 += (double)g_tta.h_cur[d]*g_tta.h_cur[d];
+    float r = 1.f/sqrtf((float)s2 + 1e-12f);
+    float *dst = g_tta.h + (int64_t)g_tta.head * D;
+    for (int d = 0; d < D; d++) dst[d] = g_tta.h_cur[d]*r;
+    g_tta.tok[g_tta.head] = tok;
+    g_tta.head = (g_tta.head + 1) % g_tta.n;
+    if (g_tta.len < g_tta.n) g_tta.len++;
+}
 
 /* ---------- caricamento config ---------- */
 static void load_cfg(Cfg *c, const char *snap) {
@@ -191,9 +296,11 @@ static int64_t fixed_bytes(Model *m, int ctx) {
     return (int64_t)nfull * 2 * c->n_kv_heads * ctx * c->head_dim * 4;
 }
 
-/* azzera gli stati ricorrenti dei layer lineari (inizio generazione / reset contesto) */
+/* azzera gli stati ricorrenti dei layer lineari (inizio generazione / reset
+ * contesto) e lo stato TTA: l'adattamento non sopravvive al reset. */
 static void state_reset(Model *m) {
     Cfg *c = &m->c;
+    tta_reset();
     if (!m->L || !c->hybrid) return;
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
@@ -415,6 +522,10 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     m->kv_len = pos_base + S;
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
+    if (g_tta.mode == TTA_CACHE && g_tta.alloc) {   /* stash per il neural cache */
+        memcpy(g_tta.h_cur, last, D*sizeof(float));
+        g_tta.h_valid = 1;
+    }
     float *logit = falloc(c->vocab);
     mat_apply(logit, last, &m->lm_head, 1);
     free(x); free(nrm); free(tmp); free(last);
