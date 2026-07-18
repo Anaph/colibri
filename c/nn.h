@@ -16,6 +16,17 @@
 #endif
 #include "simd.h"
 
+/* OpenMP: header reale se compilato con -fopenmp, altrimenti stub inline a
+ * un thread, cosi' i chiamanti (THREADS, scratch per-thread) non hanno
+ * bisogno di #ifdef sparsi. */
+#ifdef _OPENMP
+#include <omp.h>
+#else
+static inline int  omp_get_max_threads(void) { return 1; }
+static inline int  omp_get_thread_num(void)  { return 0; }
+static inline void omp_set_num_threads(int n) { (void)n; }
+#endif
+
 /* peso denso: f32 oppure int8+scala per riga (QBITS=8) */
 typedef struct { float *f; int8_t *q; float *qs; int O, I; } Mat;
 

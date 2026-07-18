@@ -15,7 +15,11 @@ static float bn_frnd(void) {
 }
 static void bn_fill(float *p, int64_t n) { for (int64_t i = 0; i < n; i++) p[i] = bn_frnd(); }
 
-int main(void) {
+int main(int argc, char **argv) {
+    (void)argc;
+    omp_hot_tune(argv);                             /* stesso tuning dei motori: numeri realistici */
+    const char *th_ = getenv("THREADS");
+    if (th_ && atoi(th_) > 0) omp_set_num_threads(atoi(th_));
     fprintf(stderr, "[bench] idot %s | f32 %s\n", IDOT_KERNEL, F32_KERNEL);
     fprintf(stderr, "%-28s %10s %10s %10s\n", "kernel", "s", "GFLOP/s", "GB/s");
 

@@ -567,5 +567,5 @@ static void banner(Model *m) {
 }
 
 #ifndef QWEN_TEST
-int main(void) { return engine_main(); }
+int main(int argc, char **argv) { return engine_main(argc, argv); }
 #endif /* QWEN_TEST */

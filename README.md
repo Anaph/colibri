@@ -80,6 +80,7 @@ Common environment variables (qwen engine):
 | `CHAT_TEMPLATE` | 1 | wrap prompt in the model's chat format |
 | `THINK` | 0 | Qwen3 thinking mode (0 pre-closes the think block) |
 | `QBITS` | 0 | 8 → int8-quantize weights at load (~2.5× less RAM) |
+| `THREADS` | — | cap the OpenMP team; overrides `OMP_NUM_THREADS`; applied before load |
 | `MEM_GB` | — | RAM budget in GiB: layers beyond the budget stream from disk each step |
 | `MEM_FRAC` | — | same budget as a fraction (0..1) of total physical RAM; `MEM_GB` wins |
 | `REF` | — | ref.json with prompt_ids/full_ids for greedy validation |
@@ -92,6 +93,11 @@ the text being generated: the neural cache mixes in a distribution over
 recently seen continuations, the bias variant runs closed-form SGD on a
 persistent logit bias. Adaptation state is cleared on every context reset
 and REF validation mode structurally bypasses it.
+
+On startup the engines seed hot-thread OpenMP defaults (`OMP_WAIT_POLICY=active`
+etc.) and re-exec themselves once so libgomp picks them up; any `OMP_`/`GOMP_`
+variable you set yourself wins, and `COLI_NO_OMP_TUNE=1` disables the whole
+mechanism.
 
 `MEM_GB`/`MEM_FRAC` (qwen and gemma) trade speed for memory: the engine keeps
 as many layers resident as fit the budget (embeddings, norms and recurrent

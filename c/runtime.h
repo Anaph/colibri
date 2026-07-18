@@ -289,8 +289,49 @@ static int64_t budget_from_env(const char *gb, const char *frac, int64_t total_r
     return 0;
 }
 
+/* ---------- tuning permanente dei thread OpenMP (portato da glm.c) ----------
+ * Le regioni parallele dei motori densi sono piccole e back-to-back (centinaia
+ * di fork/join per token); con la wait policy passiva di default libgomp
+ * parcheggia il team tra una regione e l'altra e la latenza di risveglio
+ * domina. Tenere i thread caldi (spin attivo) collassa quell'overhead: su glm
+ * il tempo matmul e' passato da 66.9s a 20.9s sulla build Zen5, senza alcuna
+ * variazione dell'output numerico.
+ *
+ * libgomp legge le variabili OMP_/GOMP_ in un COSTRUTTORE che gira prima di
+ * main(): un setenv() qui seguito dall'esecuzione normale arriverebbe troppo
+ * tardi. Quindi al primo ingresso si seminano i default vincenti — rispettando
+ * qualunque valore l'utente abbia gia' impostato (overwrite=0) — e ci si
+ * re-esegue una volta sola cosi' un costruttore libgomp fresco li raccoglie.
+ * La sentinella COLI_OMP_TUNED garantisce al massimo un re-exec; COLI_NO_OMP_TUNE=1
+ * e' il kill-switch documentato che disattiva tutto il percorso. Su piattaforme
+ * senza /proc/self/exe (o se execv fallisce) si prosegue senza tuning. */
+static void omp_hot_tune(char **argv) {
+    if (!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE")) {
+        setenv("OMP_WAIT_POLICY", "active", 0);  /* team caldo tra le regioni piccole e fitte */
+        setenv("GOMP_SPINCOUNT", "200000", 0);   /* spin breve, poi yield: le attese lunghe non bruciano un core */
+        setenv("OMP_PROC_BIND", "close", 0);     /* team impacchettato su core adiacenti (localita' di cache) */
+        setenv("OMP_DYNAMIC", "FALSE", 0);       /* team a taglia fissa: niente churn per-regione */
+        setenv("COLI_OMP_TUNED", "1", 1);
+#if defined(__linux__)
+        fprintf(stderr, "[OMP] hot-thread tuning: re-exec once (COLI_NO_OMP_TUNE=1 to skip)\n");
+        execv("/proc/self/exe", argv);           /* ritorna solo in caso di errore -> si prosegue senza tuning */
+        perror("[OMP] execv self-reexec failed, running untuned");
+#elif defined(__FreeBSD__)
+        fprintf(stderr, "[OMP] hot-thread tuning: re-exec once (COLI_NO_OMP_TUNE=1 to skip)\n");
+        execv("/proc/curproc/file", argv);       /* ritorna solo in caso di errore -> si prosegue senza tuning */
+        perror("[OMP] execv self-reexec failed, running untuned");
+#endif
+    }
+}
+
 /* ---------- main condiviso ---------- */
-static int engine_main(void) {
+static int engine_main(int argc, char **argv) {
+    (void)argc;
+    omp_hot_tune(argv);
+    /* THREADS: tetto sul team OpenMP (batte OMP_NUM_THREADS), applicato PRIMA
+     * di qualunque allocazione dipendente dal numero di thread. */
+    const char *th_ = getenv("THREADS");
+    if (th_ && atoi(th_) > 0) omp_set_num_threads(atoi(th_));
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     int qbits = getenv("QBITS") ? atoi(getenv("QBITS")) : 0;

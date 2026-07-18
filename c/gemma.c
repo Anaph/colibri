@@ -546,5 +546,5 @@ static void banner(Model *m) {
 }
 
 #ifndef GEMMA_TEST
-int main(void) { return engine_main(); }
+int main(int argc, char **argv) { return engine_main(argc, argv); }
 #endif /* GEMMA_TEST */
