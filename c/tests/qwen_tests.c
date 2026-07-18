@@ -418,3 +418,53 @@ int qt_tiny_hybrid(void) {
     CHECK(qt_run8(dir, 8, 1, b) == 0);
     return 0;
 }
+
+/* ---- MEM_GB/MEM_FRAC: parita' token con streaming ---- */
+static int qt_run8_budget(const char *dir, int64_t budget, int *out, int *resident_out) {
+    Model m;
+    model_init_ex(&m, dir, 0, budget, 16);
+    if (resident_out) *resident_out = m.n_resident;
+    kv_alloc(&m, 16);
+    int prompt[3] = {1,2,3};
+    memcpy(out, prompt, sizeof(prompt));
+    float *logit = step(&m, prompt, 3, 0);
+    int len = 3;
+    for (int s = 0; s < 8; s++) {
+        for (int i = 0; i < m.c.vocab; i++) CHECK(isfinite(logit[i]));
+        int best = argmax_v(logit, m.c.vocab);
+        free(logit);
+        out[len++] = best;
+        if (s == 7) break;
+        logit = step(&m, &out[len-1], 1, len-1);
+    }
+    return 0;
+}
+
+int qt_memknob_parity(void) {
+    /* stessi id greedy con: tutto residente (budget 0), tutto streamato
+     * (budget minuscolo -> R=0) e budget enorme (R=n_layers) — sia sul
+     * modello denso che sull'ibrido (stati deltanet sempre residenti) */
+    const char *dirs[2] = { tst_dir("qwen_tiny_model"), tst_dir("qwen_tiny_hybrid") };
+    qt_write_dense_dir(dirs[0]);
+    qt_write_hybrid_dir(dirs[1]);
+    for (int d = 0; d < 2; d++) {
+        int a[16], b[16], cc[16]; int r0, r1, r2;
+        CHECK(qt_run8_budget(dirs[d], 0, a, &r0) == 0);                    /* classico */
+        CHECK(qt_run8_budget(dirs[d], 1, b, &r1) == 0);                    /* R=0: tutto stream */
+        CHECK(qt_run8_budget(dirs[d], (int64_t)1<<40, cc, &r2) == 0);      /* R=tutti */
+        CHECK(r1 == 0 && r0 == 2 && r2 == 2);
+        for (int i = 0; i < 11; i++) CHECK(a[i]==b[i] && a[i]==cc[i]);     /* stream f32 == residente f32 */
+    }
+    return 0;
+}
+
+int qt_memknob_env(void) {
+    int64_t g8 = (int64_t)8<<30;
+    CHECK(budget_from_env("2", "0.5", g8) == (int64_t)2<<30);   /* MEM_GB batte MEM_FRAC */
+    CHECK(budget_from_env(NULL, "0.5", g8) == (int64_t)4<<30);
+    CHECK(budget_from_env("", "", g8) == 0);
+    CHECK(budget_from_env(NULL, NULL, g8) == 0);
+    CHECK(budget_from_env("0", "1.5", g8) == 0);                /* valori invalidi -> residente */
+    CHECK(budget_from_env("0.5", NULL, g8) == (int64_t)512<<20);
+    return 0;
+}

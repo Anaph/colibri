@@ -251,3 +251,42 @@ int gm_tiny_keqv(void) {
     int a[16];
     return gm_run8(dir, 0, a, 0, 1);
 }
+
+/* ---- MEM_GB/MEM_FRAC: parita' token con streaming ---- */
+static int gm_run8_budget(const char *dir, int64_t budget, int *out, int *resident_out) {
+    GModel m;
+    model_init_ex(&m, dir, 0, budget, 16);
+    if (resident_out) *resident_out = m.n_resident;
+    kv_alloc(&m, 16);
+    int prompt[3] = {1,2,3};
+    memcpy(out, prompt, sizeof(prompt));
+    float *logit = step(&m, prompt, 3, 0);
+    int len = 3;
+    for (int s = 0; s < 8; s++) {
+        for (int i = 0; i < m.c.vocab; i++) CHECK(isfinite(logit[i]));
+        int best = argmax_v(logit, m.c.vocab);
+        free(logit);
+        out[len++] = best;
+        if (s == 7) break;
+        logit = step(&m, &out[len-1], 1, len-1);
+    }
+    return 0;
+}
+
+int gm_memknob_parity(void) {
+    const char *dir = tst_dir("gemma_tiny_model");
+    gm_write_tiny(dir, 0, 0);
+    int a[16], b[16], cc[16]; int r0, r1, r2;
+    CHECK(gm_run8_budget(dir, 0, a, &r0) == 0);
+    CHECK(gm_run8_budget(dir, 1, b, &r1) == 0);                    /* R=0: tutto stream */
+    CHECK(gm_run8_budget(dir, (int64_t)1<<40, cc, &r2) == 0);
+    CHECK(r1 == 0 && r0 == 4 && r2 == 4);
+    for (int i = 0; i < 11; i++) CHECK(a[i]==b[i] && a[i]==cc[i]);
+    /* anche con kv-shared (k/v assenti sul layer condiviso) */
+    const char *ds = tst_dir("gemma_tiny_shared");
+    gm_write_tiny(ds, 1, 0);
+    CHECK(gm_run8_budget(ds, 0, a, NULL) == 0);
+    CHECK(gm_run8_budget(ds, 1, b, NULL) == 0);
+    for (int i = 0; i < 11; i++) CHECK(a[i]==b[i]);
+    return 0;
+}

@@ -81,6 +81,9 @@ typedef struct {
     Mat ple_model_proj;         /* [n_layers*ple_dim, D] */
     float *ple_proj_norm;       /* [n_layers*ple_dim]? VERIFY: norm su ple_dim */
     float **K, **V; int kv_len, max_t;
+    /* streaming a budget (MEM_GB/MEM_FRAC), stessa semantica di qwen.c */
+    int n_resident;
+    float *stream_buf;
     double load_s;
 } GModel;
 
@@ -232,7 +235,65 @@ static const char *probe_name(GModel *m, char *buf, int cap, int required, int n
     exit(1);
 }
 
-static void model_init(GModel *m, const char *snap, int qbits) {
+/* elenco delle MATRICI streamabili di un layer (richiede type/shared_kv gia'
+ * impostati; k/v assenti sui layer kv-shared, v assente con k_eq_v). */
+typedef struct { Mat *mat; char name[96]; int O, I; } MatRef;
+static int layer_matrefs(GModel *m, int li, MatRef *r) {
+    GCfg *c = &m->c; GLayer *l = &m->L[li];
+    int n = 0, D = c->hidden;
+    int hd = l->type ? c->ghd : c->head_dim;
+    int KV = l->type ? c->n_gkv : c->n_kv_heads;
+    int H = c->n_heads;
+    #define MR(field, fmt, O_, I_) do { r[n].mat=&l->field; \
+        snprintf(r[n].name,sizeof(r[n].name),"model.layers.%d." fmt,li); \
+        r[n].O=(O_); r[n].I=(I_); n++; } while(0)
+    MR(q, "self_attn.q_proj.weight", H*hd, D);
+    MR(o, "self_attn.o_proj.weight", D, H*hd);
+    if (!l->shared_kv) {
+        MR(k, "self_attn.k_proj.weight", KV*hd, D);
+        char nm[128]; snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.v_proj.weight",li);
+        if (st_has(&m->S, nm)) MR(v, "self_attn.v_proj.weight", KV*hd, D);
+    }
+    MR(gate, "mlp.gate_proj.weight", c->inter, D);
+    MR(up,   "mlp.up_proj.weight",   c->inter, D);
+    MR(down, "mlp.down_proj.weight", D, c->inter);
+    if (c->ple_dim > 0) {
+        MR(ple_gate, "per_layer_input_gate.weight", c->ple_dim, D);
+        MR(ple_proj, "per_layer_projection.weight", D, c->ple_dim);
+    }
+    #undef MR
+    return n;
+}
+
+static int64_t layer_f32_bytes(GModel *m, int li) {
+    MatRef r[12]; int n = layer_matrefs(m, li, r);
+    int64_t b = 0;
+    for (int j = 0; j < n; j++) b += (int64_t)r[j].O*r[j].I*4;
+    return b;
+}
+
+static void layer_stream_in(GModel *m, int li) {
+    MatRef r[12]; int n = layer_matrefs(m, li, r);
+    int64_t off = 0;
+    for (int j = 0; j < n; j++) {
+        st_read_f32(&m->S, r[j].name, m->stream_buf + off, 0);
+        r[j].mat->f = m->stream_buf + off;
+        r[j].mat->q = NULL; r[j].mat->qs = NULL;
+        r[j].mat->O = r[j].O; r[j].mat->I = r[j].I;
+        off += (int64_t)r[j].O*r[j].I;
+    }
+}
+
+static void layer_prefetch(GModel *m, int li) {
+#ifndef _WIN32
+    MatRef r[12]; int n = layer_matrefs(m, li, r);
+    for (int j = 0; j < n; j++) st_prefetch(&m->S, r[j].name);
+#else
+    (void)m; (void)li;
+#endif
+}
+
+static void model_init_ex(GModel *m, const char *snap, int qbits, int64_t budget_bytes, int ctx_hint) {
     memset(m, 0, sizeof(*m));
     m->qbits = qbits;
     load_cfg(&m->c, snap);
@@ -263,14 +324,12 @@ static void model_init(GModel *m, const char *snap, int qbits) {
     }
     m->L = calloc(c->n_layers, sizeof(GLayer));
     char nm[256];
+    /* 1) parte piccola SEMPRE residente: norme + flag di struttura */
     for (int i = 0; i < c->n_layers; i++) {
         GLayer *l = &m->L[i];
         l->type = c->ltype[i];
         int hd = l->type ? c->ghd : c->head_dim;
-        int KV = l->type ? c->n_gkv : c->n_kv_heads;
-        int H  = c->n_heads;
         #define LDT(field, suffix, n_) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm,n_)
-        #define LDM(field, suffix, O_, I_) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); load_mat(m,&l->field,nm,O_,I_)
         LDT(in_ln,        "input_layernorm.weight", D);
         LDT(post_attn_ln, "post_attention_layernorm.weight", D);
         LDT(pre_ff_ln,    "pre_feedforward_layernorm.weight", D);
@@ -279,33 +338,70 @@ static void model_init(GModel *m, const char *snap, int qbits) {
         LDT(kn, "self_attn.k_norm.weight", hd);
         snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.v_norm.weight",i);   /* nuovo in gemma4; opzionale */
         l->vn = st_has(&m->S, nm) ? load_t(m, nm, hd) : NULL;
-        LDM(q, "self_attn.q_proj.weight", H*hd,  D);
-        LDM(o, "self_attn.o_proj.weight", D, H*hd);
         snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.k_proj.weight",i);
         l->shared_kv = (c->kv_src[i] != i) && !st_has(&m->S, nm);
-        if (!l->shared_kv) {
-            LDM(k, "self_attn.k_proj.weight", KV*hd, D);
-            snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.v_proj.weight",i);
-            if (st_has(&m->S, nm)) {
-                load_mat(m, &l->v, nm, KV*hd, D);
-            } else if (c->k_eq_v) {
-                l->v.f = NULL; l->v.q = NULL;      /* V = K (pre-RoPE), nessuna proiezione */
-            } else {
-                fprintf(stderr, "gemma: %s assente e attention_k_eq_v=false\n", nm); exit(1);
+        snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.v_proj.weight",i);
+        if (!l->shared_kv && !st_has(&m->S, nm) && !c->k_eq_v) {
+            fprintf(stderr, "gemma: %s assente e attention_k_eq_v=false\n", nm); exit(1);
+        }
+        if (c->ple_dim > 0) { LDT(ple_norm, "post_per_layer_input_norm.weight", D); }
+        #undef LDT
+    }
+    /* 2) budget -> layer residenti (stessa logica di qwen.c) */
+    m->n_resident = c->n_layers;
+    int64_t max_lb = 0;
+    if (budget_bytes > 0) {
+        int64_t fixed = ((int64_t)c->vocab*D + D)*4;
+        if (!m->lm_tied) fixed += (int64_t)c->vocab*D*4;
+        if (c->ple_dim > 0) fixed += (int64_t)c->ple_vocab*c->n_layers*c->ple_dim*4
+                                   + (int64_t)c->n_layers*c->ple_dim*D*4;
+        fixed += (int64_t)c->n_layers * 8 * D * 4;
+        int ctx = ctx_hint > 0 ? ctx_hint : 4096;
+        for (int i = 0; i < c->n_layers; i++) {
+            if (c->kv_src[i] != i) continue;
+            int hd = c->ltype[i] ? c->ghd : c->head_dim;
+            int KV = c->ltype[i] ? c->n_gkv : c->n_kv_heads;
+            fixed += (int64_t)2 * KV * ctx * hd * 4;
+        }
+        for (int i = 0; i < c->n_layers; i++) { int64_t b = layer_f32_bytes(m, i); if (b > max_lb) max_lb = b; }
+        int64_t used = fixed + max_lb;
+        int R = 0;
+        for (; R < c->n_layers; R++) {
+            int64_t lb = layer_f32_bytes(m, R);
+            if (m->qbits == 8) lb = lb/4 + lb/64;
+            if (used + lb > budget_bytes) break;
+            used += lb;
+        }
+        m->n_resident = R;
+        fprintf(stderr, "[gemma] budget %.2f GB -> %d/%d layer residenti (fisso %.2f GB, scratch %.2f GB)\n",
+                budget_bytes/1073741824.0, R, c->n_layers, fixed/1073741824.0, max_lb/1073741824.0);
+    }
+    /* 3) matrici: residenti oppure streamate (dims impostate, f=NULL) */
+    for (int i = 0; i < c->n_layers; i++) {
+        MatRef r[12]; int n = layer_matrefs(m, i, r);
+        for (int j = 0; j < n; j++) {
+            if (i < m->n_resident) load_mat(m, r[j].mat, r[j].name, r[j].O, r[j].I);
+            else {
+                int64_t have = st_numel(&m->S, r[j].name);
+                if (have != (int64_t)r[j].O*r[j].I) {
+                    fprintf(stderr, "tensor %s: numel %lld != atteso %lld\n",
+                            r[j].name, (long long)have, (long long)((int64_t)r[j].O*r[j].I));
+                    exit(1);
+                }
+                r[j].mat->f = NULL; r[j].mat->q = NULL; r[j].mat->qs = NULL;
+                r[j].mat->O = r[j].O; r[j].mat->I = r[j].I;
             }
         }
-        LDM(gate, "mlp.gate_proj.weight", c->inter, D);
-        LDM(up,   "mlp.up_proj.weight",   c->inter, D);
-        LDM(down, "mlp.down_proj.weight", D, c->inter);
-        if (c->ple_dim > 0) {                       /* VERIFY nomi per-layer PLE */
-            LDM(ple_gate, "per_layer_input_gate.weight", c->ple_dim, D);
-            LDM(ple_proj, "per_layer_projection.weight", D, c->ple_dim);
-            LDT(ple_norm, "post_per_layer_input_norm.weight", D);
-        }
-        #undef LDT
-        #undef LDM
+    }
+    if (m->n_resident < c->n_layers) {
+        if (!max_lb) for (int i = 0; i < c->n_layers; i++) { int64_t b = layer_f32_bytes(m, i); if (b > max_lb) max_lb = b; }
+        m->stream_buf = falloc(max_lb/4);
     }
     m->load_s = now_s() - t0;
+}
+
+static void model_init(GModel *m, const char *snap, int qbits) {
+    model_init_ex(m, snap, qbits, 0, 0);
 }
 
 /* ---------- RMSNorm Gemma: peso (1+w) (zc) oppure w ---------- */
@@ -498,8 +594,13 @@ static float *step(GModel *m, const int *ids, int S, int pos_base) {
         ple_inputs(m, ids, S, ple);
     }
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
+    if (m->n_resident < c->n_layers) layer_prefetch(m, m->n_resident);
     for (int i = 0; i < c->n_layers; i++) {
         GLayer *l = &m->L[i];
+        if (i >= m->n_resident) {
+            layer_stream_in(m, i);                  /* rilegge il layer dal disco (f32) */
+            if (i + 1 < c->n_layers && i + 1 >= m->n_resident) layer_prefetch(m, i + 1);
+        }
         /* sandwich: x += post_attn_norm(attn(in_norm(x))) */
         for (int s = 0; s < S; s++) gnorm_row(c, nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D);
         attention(m, l, i, nrm, S, pos_base, tmp);
@@ -621,6 +722,14 @@ static int run_ref(GModel *m, const char *refpath) {
     return match == n_new ? 0 : 2;
 }
 
+/* ---------- budget di memoria: MEM_GB (GiB) batte MEM_FRAC (frazione della
+ * RAM fisica TOTALE, deterministico). 0 = tutto residente. ---------- */
+static int64_t budget_from_env(const char *gb, const char *frac, int64_t total_ram) {
+    if (gb && *gb) { double g = atof(gb); if (g > 0) return (int64_t)(g * 1073741824.0); }
+    if (frac && *frac) { double f = atof(frac); if (f > 0 && f <= 1 && total_ram > 0) return (int64_t)(f * total_ram); }
+    return 0;
+}
+
 /* ---------- main ---------- */
 #ifndef GEMMA_TEST
 int main(void) {
@@ -634,9 +743,10 @@ int main(void) {
     if (getenv("NUCLEUS")) g_nuc  = (float)atof(getenv("NUCLEUS"));
     if (getenv("SEED"))    g_rng  = (uint64_t)strtoull(getenv("SEED"),NULL,10) | 1u;
     int templ = getenv("CHAT_TEMPLATE") ? atoi(getenv("CHAT_TEMPLATE")) : 1;
+    int64_t budget = budget_from_env(getenv("MEM_GB"), getenv("MEM_FRAC"), compat_total_ram_bytes());
 
     GModel m;
-    model_init(&m, snap, qbits);
+    model_init_ex(&m, snap, qbits, budget, maxctx);
     int nfull = 0; for (int i = 0; i < m.c.n_layers; i++) nfull += m.c.ltype[i];
     fprintf(stderr, "[gemma] %d layer (%d full/%d sliding, finestra %d), hidden %d, %d teste (hd %d/%d, rot %d), vocab %d%s%s%s | load %.1fs | RSS %.2f GB\n",
             m.c.n_layers, nfull, m.c.n_layers-nfull, m.c.window, m.c.hidden, m.c.n_heads,

@@ -65,6 +65,10 @@ typedef struct {
     Layer *L;
     /* kv-cache per-layer: K,V come [n_kv_heads * max_t * head_dim] */
     float **K, **V; int kv_len, max_t;
+    /* streaming a budget (MEM_GB/MEM_FRAC): i primi n_resident layer stanno in
+     * RAM, gli altri vengono riletti dal disco a ogni step in stream_buf */
+    int n_resident;
+    float *stream_buf;
     double load_s;
 } Model;
 
@@ -164,7 +168,66 @@ static void load_mat(Model *m, Mat *w, const char *name, int O, int I) {
     }
 }
 
-static void model_init(Model *m, const char *snap, int qbits) {
+/* elenco delle MATRICI di un layer (unica fonte per loader, streamer e
+ * prefetcher). Richiede l->type/l->gated gia' impostati. Ritorna il numero. */
+typedef struct { Mat *mat; char name[96]; int O, I; } MatRef;
+static int layer_matrefs(Model *m, int li, MatRef *r) {
+    Cfg *c = &m->c; Layer *l = &m->L[li];
+    int n = 0, D = c->hidden, hd = c->head_dim, H = c->n_heads, KV = c->n_kv_heads;
+    #define MR(field, fmt, O_, I_) do { r[n].mat=&l->field; \
+        snprintf(r[n].name,sizeof(r[n].name),"model.layers.%d." fmt,li); \
+        r[n].O=(O_); r[n].I=(I_); n++; } while(0)
+    if (l->type == 0) {
+        MR(q, "self_attn.q_proj.weight", l->gated ? 2*H*hd : H*hd, D);
+        MR(k, "self_attn.k_proj.weight", KV*hd, D);
+        MR(v, "self_attn.v_proj.weight", KV*hd, D);
+        MR(o, "self_attn.o_proj.weight", D, H*hd);
+    } else {
+        int kd = c->lin_hk*c->lin_dk, vd = c->lin_hv*c->lin_dv, cd = 2*kd + vd;
+        MR(aqkv, "linear_attn.in_proj_qkv.weight", cd, D);
+        MR(az,   "linear_attn.in_proj_z.weight",   vd, D);
+        MR(ab,   "linear_attn.in_proj_b.weight",   c->lin_hv, D);
+        MR(aa,   "linear_attn.in_proj_a.weight",   c->lin_hv, D);
+        MR(aout, "linear_attn.out_proj.weight",    D, vd);
+    }
+    MR(gate, "mlp.gate_proj.weight", c->inter, D);
+    MR(up,   "mlp.up_proj.weight",   c->inter, D);
+    MR(down, "mlp.down_proj.weight", D, c->inter);
+    #undef MR
+    return n;
+}
+
+static int64_t layer_f32_bytes(Model *m, int li) {
+    MatRef r[12]; int n = layer_matrefs(m, li, r);
+    int64_t b = 0;
+    for (int j = 0; j < n; j++) b += (int64_t)r[j].O*r[j].I*4;
+    return b;
+}
+
+/* rilettura di un layer streamato: tutte le matrici in stream_buf (f32) */
+static void layer_stream_in(Model *m, int li) {
+    MatRef r[12]; int n = layer_matrefs(m, li, r);
+    int64_t off = 0;
+    for (int j = 0; j < n; j++) {
+        st_read_f32(&m->S, r[j].name, m->stream_buf + off, 0);  /* drop=0: la page cache aiuta */
+        r[j].mat->f = m->stream_buf + off;
+        r[j].mat->q = NULL; r[j].mat->qs = NULL;
+        r[j].mat->O = r[j].O; r[j].mat->I = r[j].I;
+        off += (int64_t)r[j].O*r[j].I;
+    }
+}
+
+static void layer_prefetch(Model *m, int li) {
+#ifndef _WIN32                       /* su Windows WILLNEED e' sincrono: niente overlap */
+    MatRef r[12]; int n = layer_matrefs(m, li, r);
+    for (int j = 0; j < n; j++) st_prefetch(&m->S, r[j].name);
+#else
+    (void)m; (void)li;
+#endif
+}
+
+/* budget_bytes==0 -> tutto residente (comportamento classico) */
+static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_bytes, int ctx_hint) {
     memset(m, 0, sizeof(*m));
     m->qbits = qbits;
     load_cfg(&m->c, snap);
@@ -180,35 +243,25 @@ static void model_init(Model *m, const char *snap, int qbits) {
     } else {
         load_mat(m, &m->lm_head, "lm_head.weight", c->vocab, c->hidden);
     }
-    int D = c->hidden, hd = c->head_dim, H = c->n_heads, KV = c->n_kv_heads;
+    int D = c->hidden, hd = c->head_dim, H = c->n_heads;
     m->L = calloc(c->n_layers, sizeof(Layer));
     char nm[256];
+    /* 1) parte piccola SEMPRE residente: norme, vettori e stati deltanet */
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
         l->type = c->ltype[i];
-        #define LDT(field, suffix, n) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm,n)
-        #define LDM(field, suffix, O_, I_) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); load_mat(m,&l->field,nm,O_,I_)
+        #define LDT(field, suffix, n_) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm,n_)
         LDT(in_ln,  "input_layernorm.weight", D);
         LDT(post_ln,"post_attention_layernorm.weight", D);
-        if (l->type == 0) {                          /* full attention (Qwen3 o gated Qwen3.5) */
+        if (l->type == 0) {
             LDT(qn, "self_attn.q_norm.weight", hd);  /* per testa, NON per hidden */
             LDT(kn, "self_attn.k_norm.weight", hd);
-            /* Qwen3.5: q_proj raddoppiato = [query|gate] per testa. Rilevato dalla forma. */
+            /* Qwen3.5: q_proj raddoppiato = [query|gate]. Rilevato dalla forma. */
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_proj.weight",i);
-            int64_t qn_ = st_numel(&m->S, nm);
-            l->gated = (qn_ == (int64_t)2*H*hd*D);
-            load_mat(m, &l->q, nm, l->gated ? 2*H*hd : H*hd, D);
-            LDM(k, "self_attn.k_proj.weight", KV*hd, D);
-            LDM(v, "self_attn.v_proj.weight", KV*hd, D);
-            LDM(o, "self_attn.o_proj.weight", D, H*hd);
-        } else {                                     /* linear attention (Gated DeltaNet) */
+            l->gated = (st_numel(&m->S, nm) == (int64_t)2*H*hd*D);
+        } else {
             int kd = c->lin_hk*c->lin_dk, vd = c->lin_hv*c->lin_dv;
             int cd = 2*kd + vd, K = c->lin_conv;
-            LDM(aqkv, "linear_attn.in_proj_qkv.weight", cd, D);
-            LDM(az,   "linear_attn.in_proj_z.weight",   vd, D);
-            LDM(ab,   "linear_attn.in_proj_b.weight",   c->lin_hv, D);
-            LDM(aa,   "linear_attn.in_proj_a.weight",   c->lin_hv, D);
-            LDM(aout, "linear_attn.out_proj.weight",    D, vd);
             LDT(conv_w,  "linear_attn.conv1d.weight", (int64_t)cd*K);   /* [cd,1,K] depthwise */
             snprintf(nm,sizeof(nm),"model.layers.%d.linear_attn.conv1d.bias",i);
             l->conv_b = st_has(&m->S, nm) ? load_t(m, nm, cd) : NULL;
@@ -218,13 +271,56 @@ static void model_init(Model *m, const char *snap, int qbits) {
             l->conv_state = falloc((int64_t)cd*K);
             l->Sstate = falloc((int64_t)c->lin_hv*c->lin_dk*c->lin_dv);
         }
-        LDM(gate, "mlp.gate_proj.weight", c->inter, D);
-        LDM(up,   "mlp.up_proj.weight",   c->inter, D);
-        LDM(down, "mlp.down_proj.weight", D, c->inter);
         #undef LDT
-        #undef LDM
+    }
+    /* 2) budget -> quanti layer di matrici stanno residenti */
+    m->n_resident = c->n_layers;
+    int64_t max_lb = 0;
+    if (budget_bytes > 0) {
+        int64_t fixed = ((int64_t)c->vocab*D + D)*4;               /* embed + final_norm */
+        if (!m->lm_tied) fixed += (int64_t)c->vocab*D*4;
+        fixed += (int64_t)c->n_layers * 8 * D * 4;                 /* norme/vettori: stima larga */
+        int nfull = 0; for (int i = 0; i < c->n_layers; i++) if (!c->ltype[i]) nfull++;
+        fixed += (int64_t)nfull * 2 * c->n_kv_heads * (ctx_hint>0?ctx_hint:4096) * hd * 4;   /* KV */
+        for (int i = 0; i < c->n_layers; i++) { int64_t b = layer_f32_bytes(m, i); if (b > max_lb) max_lb = b; }
+        int64_t used = fixed + max_lb;                             /* scratch di streaming */
+        int R = 0;
+        for (; R < c->n_layers; R++) {
+            int64_t lb = layer_f32_bytes(m, R);
+            if (m->qbits == 8) lb = lb/4 + lb/64;                  /* int8 + scale */
+            if (used + lb > budget_bytes) break;
+            used += lb;
+        }
+        m->n_resident = R;
+        fprintf(stderr, "[qwen] budget %.2f GB -> %d/%d layer residenti (fisso %.2f GB, scratch %.2f GB)\n",
+                budget_bytes/1073741824.0, R, c->n_layers, fixed/1073741824.0, max_lb/1073741824.0);
+    }
+    /* 3) matrici: residenti (QBITS onorato) o streamate (dims impostate, f=NULL) */
+    for (int i = 0; i < c->n_layers; i++) {
+        MatRef r[12]; int n = layer_matrefs(m, i, r);
+        for (int j = 0; j < n; j++) {
+            if (i < m->n_resident) load_mat(m, r[j].mat, r[j].name, r[j].O, r[j].I);
+            else {
+                int64_t have = st_numel(&m->S, r[j].name);
+                if (have != (int64_t)r[j].O*r[j].I) {
+                    fprintf(stderr, "tensor %s: numel %lld != atteso %lld\n",
+                            r[j].name, (long long)have, (long long)((int64_t)r[j].O*r[j].I));
+                    exit(1);
+                }
+                r[j].mat->f = NULL; r[j].mat->q = NULL; r[j].mat->qs = NULL;
+                r[j].mat->O = r[j].O; r[j].mat->I = r[j].I;
+            }
+        }
+    }
+    if (m->n_resident < c->n_layers) {
+        if (!max_lb) for (int i = 0; i < c->n_layers; i++) { int64_t b = layer_f32_bytes(m, i); if (b > max_lb) max_lb = b; }
+        m->stream_buf = falloc(max_lb/4);
     }
     m->load_s = now_s() - t0;
+}
+
+static void model_init(Model *m, const char *snap, int qbits) {
+    model_init_ex(m, snap, qbits, 0, 0);
 }
 
 /* azzera gli stati ricorrenti dei layer lineari (inizio generazione / reset contesto) */
@@ -442,8 +538,13 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     float *x = falloc((int64_t)S*D);
     for (int s = 0; s < S; s++) memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
+    if (m->n_resident < c->n_layers) layer_prefetch(m, m->n_resident);
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
+        if (i >= m->n_resident) {
+            layer_stream_in(m, i);                  /* rilegge il layer dal disco (f32) */
+            if (i + 1 < c->n_layers && i + 1 >= m->n_resident) layer_prefetch(m, i + 1);
+        }
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
         if (l->type == 1) deltanet(m, l, nrm, S, tmp);
         else attention(m, l, i, nrm, S, pos_base, tmp);
@@ -555,6 +656,14 @@ static int run_ref(Model *m, const char *refpath) {
     return match == n_new ? 0 : 2;
 }
 
+/* ---------- budget di memoria: MEM_GB (GiB) batte MEM_FRAC (frazione della
+ * RAM fisica TOTALE, deterministico). 0 = tutto residente. ---------- */
+static int64_t budget_from_env(const char *gb, const char *frac, int64_t total_ram) {
+    if (gb && *gb) { double g = atof(gb); if (g > 0) return (int64_t)(g * 1073741824.0); }
+    if (frac && *frac) { double f = atof(frac); if (f > 0 && f <= 1 && total_ram > 0) return (int64_t)(f * total_ram); }
+    return 0;
+}
+
 /* ---------- main ---------- */
 #ifndef QWEN_TEST
 int main(void) {
@@ -569,9 +678,10 @@ int main(void) {
     if (getenv("SEED"))    g_rng  = (uint64_t)strtoull(getenv("SEED"),NULL,10) | 1u;
     int templ = getenv("CHAT_TEMPLATE") ? atoi(getenv("CHAT_TEMPLATE")) : 1;
     int think = getenv("THINK") ? atoi(getenv("THINK")) : 0;
+    int64_t budget = budget_from_env(getenv("MEM_GB"), getenv("MEM_FRAC"), compat_total_ram_bytes());
 
     Model m;
-    model_init(&m, snap, qbits);
+    model_init_ex(&m, snap, qbits, budget, maxctx);
     int nlin = 0; for (int i = 0; i < m.c.n_layers; i++) nlin += m.c.ltype[i];
     fprintf(stderr, "[qwen] %d layer (%d deltanet), hidden %d, %d/%d teste (hd %d, rot %d), inter %d, vocab %d%s | load %.1fs | RSS %.2f GB\n",
             m.c.n_layers, nlin, m.c.hidden, m.c.n_heads, m.c.n_kv_heads, m.c.head_dim, m.c.rot, m.c.inter, m.c.vocab,

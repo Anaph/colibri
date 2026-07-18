@@ -13,6 +13,8 @@ int qt_deltanet_large(void);
 int qt_tiny_dense(void);
 int qt_tiny_qbits(void);
 int qt_tiny_hybrid(void);
+int qt_memknob_parity(void);
+int qt_memknob_env(void);
 }
 
 #define C_TEST(suite, name, fn) \
@@ -29,3 +31,5 @@ C_TEST(QwenDeltanet, DoubleRefLarge,    qt_deltanet_large)
 C_TEST(QwenTiny,     DenseDeterministic, qt_tiny_dense)
 C_TEST(QwenTiny,     Qbits8Finite,       qt_tiny_qbits)
 C_TEST(QwenTiny,     HybridDeterministic, qt_tiny_hybrid)
+C_TEST(QwenMemKnob,  StreamTokenParity,   qt_memknob_parity)
+C_TEST(QwenMemKnob,  EnvPrecedence,       qt_memknob_env)

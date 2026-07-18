@@ -317,4 +317,28 @@ static inline int compat_setenv(const char *name, const char *value, int overwri
 #define COMPAT_O_RDONLY O_RDONLY
 #endif
 
+/* --- RAM fisica TOTALE in byte (0 se non determinabile) ---
+ * Deliberatamente "total" e non "available": MEM_FRAC deve dare lo stesso
+ * numero di layer residenti a ogni run (determinismo del debug). */
+#ifdef _WIN32
+static inline long long compat_total_ram_bytes(void){
+    MEMORYSTATUSEX msx = {0};
+    msx.dwLength = sizeof(msx);
+    return GlobalMemoryStatusEx(&msx) ? (long long)msx.ullTotalPhys : 0;
+}
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
+static inline long long compat_total_ram_bytes(void){
+    long long mem = 0; size_t len = sizeof(mem);
+    int mib[2] = { CTL_HW, HW_MEMSIZE };
+    return sysctl(mib, 2, &mem, &len, NULL, 0) == 0 ? mem : 0;
+}
+#else
+#include <unistd.h>
+static inline long long compat_total_ram_bytes(void){
+    long pages = sysconf(_SC_PHYS_PAGES), psize = sysconf(_SC_PAGE_SIZE);
+    return (pages > 0 && psize > 0) ? (long long)pages * psize : 0;
+}
+#endif
+
 #endif /* COMPAT_H */

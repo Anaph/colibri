@@ -9,6 +9,7 @@ int gm_sliding(void);
 int gm_tiny(void);
 int gm_tiny_shared(void);
 int gm_tiny_keqv(void);
+int gm_memknob_parity(void);
 }
 
 #define C_TEST(suite, name, fn) \
@@ -21,3 +22,4 @@ C_TEST(GemmaAttn,    SlidingVsBruteForce, gm_sliding)
 C_TEST(GemmaTiny,    HybridDeterministic, gm_tiny)
 C_TEST(GemmaTiny,    KvShared,           gm_tiny_shared)
 C_TEST(GemmaTiny,    KEqualsV,           gm_tiny_keqv)
+C_TEST(GemmaMemKnob, StreamTokenParity,  gm_memknob_parity)

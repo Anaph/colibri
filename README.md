@@ -11,6 +11,7 @@ Three standalone engines, one per architecture:
 | `glm` | GLM-5.2 (744B MoE) | MLA attention, experts streamed from disk, ~25 GB RAM |
 | `olmoe` | OLMoE | Reference GQA-MoE engine |
 | `qwen` | Qwen3 dense / Qwen3.5 hybrid | GQA + QK-norm; Gated DeltaNet + Gated Attention |
+| `gemma` | Gemma 4 (e.g. 12B-it, text-only) | Sliding/global hybrid, p-RoPE, GeGLU, SP tokenizer |
 
 ## Build
 
@@ -57,8 +58,17 @@ Common environment variables (qwen engine):
 | `CHAT_TEMPLATE` | 1 | wrap prompt in the model's chat format |
 | `THINK` | 0 | Qwen3 thinking mode (0 pre-closes the think block) |
 | `QBITS` | 0 | 8 → int8-quantize weights at load (~2.5× less RAM) |
+| `MEM_GB` | — | RAM budget in GiB: layers beyond the budget stream from disk each step |
+| `MEM_FRAC` | — | same budget as a fraction (0..1) of total physical RAM; `MEM_GB` wins |
 | `REF` | — | ref.json with prompt_ids/full_ids for greedy validation |
 | `TOKENS` | 0 | 1 → dump generated token ids to stderr |
+
+`MEM_GB`/`MEM_FRAC` (qwen and gemma) trade speed for memory: the engine keeps
+as many layers resident as fit the budget (embeddings, norms and recurrent
+state always stay resident) and re-reads the remaining layers from the
+safetensors on every step, prefetching the next layer while the current one
+computes. Streamed layers always run f32 (`QBITS` applies to resident layers
+only); token output is identical at any budget. Unset → everything resident.
 
 ## Qwen engine notes
 
@@ -113,12 +123,26 @@ by the reference tokenizer before debugging model-level mismatches.
 c/glm.c      GLM-5.2 engine (single file)
 c/olmoe.c    OLMoE reference engine
 c/qwen.c     Qwen3 / Qwen3.5 engine
+c/gemma.c    Gemma 4 engine (text-only)
+c/nn.h       shared kernels: matmul f32/int8, quantization, sampler
 c/st.h       safetensors loader (multi-shard, BF16/F16/F32)
-c/tok.h      byte-level BPE tokenizer (tokenizer.json)
+c/tok.h      BPE tokenizer: byte-level and SentencePiece modes
 c/json.h     minimal JSON parser
 c/compat.h   cross-platform shims
-c/tests/     C unit tests (make test)
+c/tests/     test suite: C logic + GoogleTest glue (make test)
 ```
+
+### Gemma engine notes
+
+`gemma` runs the Gemma 4 text stack: sliding-window attention interleaved
+with global layers (p-RoPE, optionally larger global head_dim), per-head
+q/k/v RMSNorm, sandwich norms, GeGLU, optional KV-sharing / K=V / per-layer
+embeddings — all config-driven. A few checkpoint conventions could not be
+verified offline and sit behind loud probes (see VERIFY comments in
+`c/gemma.c`); on first run against a real snapshot, resolve any reported
+tensor-name/shape mismatch, validate the tokenizer with `tok_oracle`, then
+gate with REF mode. `GEMMA_NORM_PLAIN=1` switches the RMSNorm convention
+from `(1+w)` to `w` if REF parity points at the norm.
 
 ## License
 
