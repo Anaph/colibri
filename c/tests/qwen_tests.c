@@ -485,6 +485,152 @@ int qt_memknob_env(void) {
     return 0;
 }
 
+/* ---- LoRA runtime: writer stw, loader, no-op e effetto ---- */
+
+/* parita' stw <-> st: quello che stw_write scrive, st_init_file lo rilegge uguale */
+int qt_stw_st_parity(void) {
+    const char *tmp = getenv("TMPDIR"); if (!tmp) tmp = "/tmp";
+    char path[600]; snprintf(path, sizeof(path), "%s/qwen_stw_parity.safetensors", tmp);
+    qt_rng_s = 77;
+    float a[24], b[6], c[40];
+    qt_fill(a, 24, 1); qt_fill(b, 6, 1); qt_fill(c, 40, 1);
+    int64_t sa[2] = {4,6}, sb[1] = {6}, sc[3] = {2,4,5};
+    stw_add("alpha", 2, sa, a);
+    stw_add("beta",  1, sb, b);
+    stw_add("gamma", 3, sc, c);
+    stw_write(path);
+    shards LS; st_init_file(&LS, path);
+    CHECK(LS.n == 3);
+    CHECK(st_numel(&LS,"alpha") == 24 && st_numel(&LS,"beta") == 6 && st_numel(&LS,"gamma") == 40);
+    float ra[24], rb[6], rc[40];
+    st_read_f32(&LS, "alpha", ra, 0);
+    st_read_f32(&LS, "beta",  rb, 0);
+    st_read_f32(&LS, "gamma", rc, 0);
+    CHECK(!memcmp(a, ra, sizeof(a)) && !memcmp(b, rb, sizeof(b)) && !memcmp(c, rc, sizeof(c)));
+    return 0;
+}
+
+/* aggiunge uno slot base.A/base.B al writer; B a zero se zeroB; A[0] in *a0 */
+static void qt_lora_add(const char *base, int r, int I, int O, int zeroB, float *a0) {
+    char nm[220];
+    float A[128], B[128];
+    qt_fill(A, (int64_t)r*I, 0.5f);
+    if (zeroB) memset(B, 0, sizeof(B)); else qt_fill(B, (int64_t)O*r, 0.5f);
+    int64_t sA[2] = {r, I}, sB[2] = {O, r};
+    snprintf(nm, sizeof(nm), "%s.A", base); stw_add(nm, 2, sA, A);
+    snprintf(nm, sizeof(nm), "%s.B", base); stw_add(nm, 2, sB, B);
+    if (a0) *a0 = A[0];
+}
+
+/* un passo greedy dal prompt {1,2,3}; logits (malloc'd) dell'ultimo token */
+static float *qt_lora_step3(const char *dir, const char *lora_path) {
+    Model m; model_init(&m, dir, 0);
+    if (lora_path) {
+        setenv("LORA", lora_path, 1);
+        lora_load(&m);
+        unsetenv("LORA");
+    }
+    kv_alloc(&m, 16);
+    int ids[3] = {1,2,3};
+    return step(&m, ids, 3, 0);
+}
+
+/* adattatore con B=0: i logits restano identici al modello base */
+int qt_lora_zero_noop(void) {
+    const char *dir = tst_dir("qwen_tiny_model");
+    qt_write_dense_dir(dir);
+    const char *tmp = getenv("TMPDIR"); if (!tmp) tmp = "/tmp";
+    char lp[600]; snprintf(lp, sizeof(lp), "%s/qwen_lora_zero.safetensors", tmp);
+    qt_rng_s = 101;
+    qt_lora_add("lora.layers.1.mlp.down_proj", 2, 32, 16, 1, NULL);
+    float alpha = 4.f; int64_t s1[1] = {1};
+    stw_add("lora.alpha", 1, s1, &alpha);
+    stw_write(lp);
+    float *base = qt_lora_step3(dir, NULL);
+    float *with = qt_lora_step3(dir, lp);
+    for (int v = 0; v < 32; v++) CHECK(base[v] == with[v]);
+    free(base); free(with);
+    return 0;
+}
+
+/* lora_apply vs riferimento double + effetto end-to-end con B != 0 */
+int qt_lora_effect(void) {
+    /* unit: y = y0 + (alpha/r)*B·(A·x) elemento per elemento in double */
+    int I = 32, O = 16, r = 3, S = 2;
+    float A[3*32], B[16*3], x[2*32], y[2*16], y0[2*16];
+    qt_rng_s = 202;
+    qt_fill(A, 96, 0.7f); qt_fill(B, 48, 0.7f); qt_fill(x, 64, 1.f); qt_fill(y0, 32, 1.f);
+    memcpy(y, y0, sizeof(y));
+    Lora lo = {A, B, r, 6.f};
+    lora_apply(&lo, y, x, S, I, O);
+    for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
+        double acc = y0[s*O+o];
+        for (int j = 0; j < r; j++) {
+            double t = 0;
+            for (int i = 0; i < I; i++) t += (double)A[j*I+i] * x[s*I+i];
+            acc += (6.0/r) * (double)B[o*r+j] * t;
+        }
+        CHECK(fabs(acc - (double)y[s*O+o]) < 1e-5);
+    }
+    /* e2e: stesso slot di qt_lora_zero_noop ma B casuale -> logits diversi */
+    const char *dir = tst_dir("qwen_tiny_model");
+    qt_write_dense_dir(dir);
+    const char *tmp = getenv("TMPDIR"); if (!tmp) tmp = "/tmp";
+    char lp[600]; snprintf(lp, sizeof(lp), "%s/qwen_lora_eff.safetensors", tmp);
+    qt_rng_s = 101;
+    qt_lora_add("lora.layers.1.mlp.down_proj", 2, 32, 16, 0, NULL);
+    float alpha = 4.f; int64_t s1[1] = {1};
+    stw_add("lora.alpha", 1, s1, &alpha);
+    stw_write(lp);
+    float *base = qt_lora_step3(dir, NULL);
+    float *with = qt_lora_step3(dir, lp);
+    int diff = 0;
+    for (int v = 0; v < 32; v++) { CHECK(isfinite(with[v])); if (base[v] != with[v]) diff = 1; }
+    CHECK(diff);
+    free(base); free(with);
+    return 0;
+}
+
+/* roundtrip completo: 7 slot x 2 layer + lm_head sopravvivono a stw+lora_load */
+int qt_lora_roundtrip(void) {
+    const char *dir = tst_dir("qwen_tiny_model");
+    qt_write_dense_dir(dir);
+    const char *tmp = getenv("TMPDIR"); if (!tmp) tmp = "/tmp";
+    char lp[600]; snprintf(lp, sizeof(lp), "%s/qwen_lora_rt.safetensors", tmp);
+    static const char *subs[7] = {"self_attn.q_proj","self_attn.k_proj","self_attn.v_proj",
+                                  "self_attn.o_proj","mlp.gate_proj","mlp.up_proj","mlp.down_proj"};
+    static const int Is[7] = {16,16,16,32,16,16,32};
+    static const int Os[7] = {32,16,16,16,32,32,16};
+    qt_rng_s = 303;
+    float a0[15]; int na = 0;
+    char base[160];
+    for (int i = 0; i < 2; i++)
+        for (int s = 0; s < 7; s++) {
+            snprintf(base, sizeof(base), "lora.layers.%d.%s", i, subs[s]);
+            qt_lora_add(base, 2, Is[s], Os[s], 0, &a0[na++]);
+        }
+    qt_lora_add("lora.lm_head", 2, 16, 32, 0, &a0[na]);
+    float alpha = 5.f; int64_t s1[1] = {1};
+    stw_add("lora.alpha", 1, s1, &alpha);
+    stw_write(lp);
+    Model m; model_init(&m, dir, 0);
+    setenv("LORA", lp, 1);
+    lora_load(&m);
+    unsetenv("LORA");
+    na = 0;
+    for (int i = 0; i < 2; i++) {
+        CHECK(m.L[i].lo);
+        Lora *sl[7] = {&m.L[i].lo->q, &m.L[i].lo->k, &m.L[i].lo->v, &m.L[i].lo->o,
+                       &m.L[i].lo->gate, &m.L[i].lo->up, &m.L[i].lo->down};
+        for (int s = 0; s < 7; s++) {
+            CHECK(sl[s]->r == 2 && sl[s]->alpha == 5.f);
+            CHECK(sl[s]->A[0] == a0[na]); na++;
+        }
+    }
+    CHECK(m.lm_lora.r == 2 && m.lm_lora.alpha == 5.f && m.lm_lora.A[0] == a0[na]);
+    return 0;
+}
+
 /* ---- TTA sperimentale: cache neurale e bias sui logit ---- */
 
 /* protocollo di gen_turn guidato a mano: step -> adjust -> (prob del vero

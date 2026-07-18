@@ -120,7 +120,7 @@ glm$(EXE): glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h
 olmoe$(EXE): olmoe.c nn.h st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
 
-qwen$(EXE): qwen.c nn.h runtime.h st.h json.h tok.h tok_unicode.h compat.h
+qwen$(EXE): qwen.c nn.h runtime.h st.h stw.h json.h tok.h tok_unicode.h compat.h
 	$(CC) $(CFLAGS) qwen.c -o qwen$(EXE) $(LDFLAGS)
 
 gemma$(EXE): gemma.c nn.h runtime.h st.h json.h tok.h tok_unicode.h compat.h

@@ -20,6 +20,7 @@
 #include <time.h>
 #include "nn.h"
 #include "st.h"
+#include "stw.h"
 #include "tok.h"
 
 #define ENGINE_TAG "qwen"
@@ -49,6 +50,10 @@ typedef struct {
     int *ltype;                 /* [n_layers] LT_FULL / LT_LINEAR */
 } Cfg;
 
+/* adattatore rank-r: y += (alpha/r) * B·(A·x); A[r,I], B[O,r]; B=0 => no-op */
+typedef struct { float *A, *B; int r; float alpha; } Lora;
+typedef struct { Lora q, k, v, o, gate, up, down; } LoraLayer;
+
 typedef struct {
     int type;                              /* LT_FULL / LT_LINEAR */
     float *in_ln, *post_ln;
@@ -65,6 +70,7 @@ typedef struct {
     float *Sstate;                         /* [lin_hv * lin_dk * lin_dv] persistente */
     /* mlp (comune) */
     Mat gate, up, down;
+    LoraLayer *lo;                         /* adattatori LoRA (NULL = spenti) */
 } Layer;
 
 typedef struct {
@@ -73,6 +79,7 @@ typedef struct {
     int qbits;
     float *embed, *final_norm;
     Mat lm_head; int lm_tied;
+    Lora lm_lora;                          /* adattatore LoRA sull'lm_head (r=0 = spento) */
     Layer *L;
     /* kv-cache per-layer: K,V come [n_kv_heads * max_t * head_dim] */
     float **K, **V; int kv_len, max_t;
@@ -89,8 +96,10 @@ typedef struct {
  * gradiente in forma chiusa. Default SPENTO: gli hook costano un branch. */
 static void tta_adjust(Model *m, float *lo);
 static void tta_observe(Model *m, int tok);
+static void lora_load(Model *m);
 #define ENGINE_LOGITS_HOOK(m, lo) tta_adjust((m), (lo))
 #define ENGINE_OBSERVE(m, tok)    tta_observe((m), (tok))
+#define ENGINE_POST_INIT(m)       lora_load(m)
 
 #include "runtime.h"
 
@@ -189,6 +198,108 @@ static void tta_observe(Model *m, int tok) {
     g_tta.tok[g_tta.head] = tok;
     g_tta.head = (g_tta.head + 1) % g_tta.n;
     if (g_tta.len < g_tta.n) g_tta.len++;
+}
+
+/* ---------- LoRA runtime ----------
+ * Adattatori low-rank sul percorso denso: y += (alpha/r)*B·(A·x) dopo ogni
+ * proiezione adattata. Caricati da LORA=<file|dir safetensors> con nomi
+ * lora.layers.N.self_attn.{q,k,v,o}_proj.{A,B}, lora.layers.N.mlp.{gate,up,
+ * down}_proj.{A,B}, lora.lm_head.{A,B} e scalare opzionale lora.alpha. */
+#define LORA_MAX_R 64
+
+/* applica l'adattatore su y[S,O] con input x[S,I]; seriale (r piccolo) */
+static void lora_apply(const Lora *lo, float *y, const float *x, int S, int I, int O) {
+    if (!lo || !lo->A || lo->r <= 0) return;
+    float sc = lo->alpha / lo->r;
+    float t[LORA_MAX_R];                        /* r <= LORA_MAX_R garantito al load */
+    for (int s = 0; s < S; s++) {
+        const float *xs = x + (int64_t)s*I;
+        for (int j = 0; j < lo->r; j++) t[j] = dot_f32(lo->A + (int64_t)j*I, xs, I);
+        float *ys = y + (int64_t)s*O;
+        for (int o = 0; o < O; o++) ys[o] += sc * dot_f32(lo->B + (int64_t)o*lo->r, t, lo->r);
+    }
+}
+
+/* carica uno slot base.A/base.B se presente; valida rank e forme contro le
+ * dimensioni della matrice base. Ritorna r caricato, 0 se assente. */
+static int lora_slot(shards *LS, char *used, const char *base, Lora *lo, int I, int O, float alpha) {
+    char na[192], nb[192];
+    snprintf(na, sizeof(na), "%s.A", base);
+    snprintf(nb, sizeof(nb), "%s.B", base);
+    st_tensor *ta = st_find(LS, na);
+    if (!ta) return 0;
+    st_tensor *tb = st_find(LS, nb);
+    if (!tb) { fprintf(stderr, "[qwen] LoRA: %s presente ma manca %s\n", na, nb); exit(1); }
+    if (I <= 0 || ta->numel % I) {
+        fprintf(stderr, "[qwen] LoRA: %s numel %lld incompatibile con I=%d\n", na, (long long)ta->numel, I); exit(1); }
+    int r = (int)(ta->numel / I);
+    if (r < 1 || r > LORA_MAX_R || tb->numel != (int64_t)O*r) {
+        fprintf(stderr, "[qwen] LoRA: %s: rank %d fuori range [1,%d] oppure %s numel %lld != %d*%d\n",
+                na, r, LORA_MAX_R, nb, (long long)tb->numel, O, r); exit(1); }
+    lo->r = r;
+    lo->alpha = alpha > 0 ? alpha : 2.0f*r;     /* default: alpha = 2r */
+    lo->A = falloc(ta->numel); st_read_f32(LS, na, lo->A, 0);
+    lo->B = falloc(tb->numel); st_read_f32(LS, nb, lo->B, 0);
+    used[ta - LS->t] = 1; used[tb - LS->t] = 1;
+    return r;
+}
+
+/* legge LORA=<path> (file singolo o directory safetensors) e attacca gli
+ * adattatori al modello. Fallisce RUMOROSAMENTE su tensori non riconosciuti. */
+static void lora_load(Model *m) {
+    const char *path = getenv("LORA");
+    if (!path || !*path) return;
+    struct stat sb;
+    if (stat(path, &sb) != 0) { perror(path); exit(1); }
+    shards LS;
+    if (S_ISDIR(sb.st_mode)) st_init(&LS, path);
+    else st_init_file(&LS, path);
+    char *used = calloc(LS.n ? LS.n : 1, 1);
+    float alpha = 0.f;                          /* 0 = non impostato -> default 2r per slot */
+    st_tensor *tal = st_find(&LS, "lora.alpha");
+    if (tal) {
+        if (tal->numel != 1) { fprintf(stderr, "[qwen] LoRA: lora.alpha deve essere scalare\n"); exit(1); }
+        st_read_f32(&LS, "lora.alpha", &alpha, 0);
+        used[tal - LS.t] = 1;
+    }
+    int nt = 0, rload = 0;
+    int D = m->c.hidden, IN = m->c.inter;
+    for (int i = 0; i < m->c.n_layers; i++) {
+        Layer *l = &m->L[i];
+        LoraLayer tmp; memset(&tmp, 0, sizeof(tmp));
+        char base[160];
+        int got = 0;
+        #define SLOT(field, sub, I_, O_) do { \
+            snprintf(base, sizeof(base), "lora.layers.%d." sub, i); \
+            int r_ = lora_slot(&LS, used, base, &tmp.field, (I_), (O_), alpha); \
+            if (r_) { got = 1; nt += 2; rload = r_; } } while (0)
+        SLOT(q,    "self_attn.q_proj", D, l->q.O);
+        SLOT(k,    "self_attn.k_proj", D, l->k.O);
+        SLOT(v,    "self_attn.v_proj", D, l->v.O);
+        SLOT(o,    "self_attn.o_proj", l->o.I, D);
+        SLOT(gate, "mlp.gate_proj", D, IN);
+        SLOT(up,   "mlp.up_proj",   D, IN);
+        SLOT(down, "mlp.down_proj", IN, D);
+        #undef SLOT
+        if (got) {
+            l->lo = calloc(1, sizeof(LoraLayer));
+            if (!l->lo) { fprintf(stderr, "[qwen] LoRA: OOM\n"); exit(1); }
+            *l->lo = tmp;
+        }
+    }
+    if (lora_slot(&LS, used, "lora.lm_head", &m->lm_lora, D, m->c.vocab, alpha)) nt += 2;
+    /* ogni tensore lora.* del file deve essere stato consumato: un nome storto
+     * (typo, layout diverso) sarebbe altrimenti ignorato in silenzio */
+    int bad = 0;
+    for (int i = 0; i < LS.n; i++)
+        if (!used[i]) { fprintf(stderr, "[qwen] LoRA: tensore non riconosciuto: %s\n", LS.t[i].name); bad = 1; }
+    if (bad) exit(1);
+    free(used);
+    fprintf(stderr, "[qwen] LoRA: %d tensori, r=%d, alpha=%g, layer adattati:", nt, rload,
+            alpha > 0 ? alpha : 2.0f*rload);
+    for (int i = 0; i < m->c.n_layers; i++) if (m->L[i].lo) fprintf(stderr, " %d", i);
+    if (m->lm_lora.r) fprintf(stderr, " +lm_head");
+    fprintf(stderr, "\n");
 }
 
 /* ---------- caricamento config ---------- */
@@ -338,6 +449,8 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     if (l->gated) {
         float *qg = falloc(S*2*qw);
         mat_apply(qg, x, &l->q, S);
+        /* LoRA sul buffer fuso [query|gate] PRIMA dello split (O = l->q.O = 2*H*hd) */
+        if (l->lo) lora_apply(&l->lo->q, qg, x, S, l->q.I, l->q.O);
         q = falloc(S*qw); gate = falloc(S*qw);
         for (int s = 0; s < S; s++) for (int hh = 0; hh < H; hh++) {
             memcpy(q    + s*qw + (int64_t)hh*hd, qg + s*2*qw + (int64_t)hh*2*hd,      hd*sizeof(float));
@@ -347,10 +460,15 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     } else {
         q = falloc(S*qw);
         mat_apply(q, x, &l->q, S);
+        if (l->lo) lora_apply(&l->lo->q, q, x, S, l->q.I, l->q.O);
     }
     float *k = falloc(S*kw), *vv = falloc(S*kw);
     mat_apply(k,  x, &l->k, S);
     mat_apply(vv, x, &l->v, S);
+    if (l->lo) {
+        lora_apply(&l->lo->k, k,  x, S, l->k.I, l->k.O);
+        lora_apply(&l->lo->v, vv, x, S, l->v.I, l->v.O);
+    }
     /* qk-norm PER TESTA (Qwen3), poi RoPE per testa */
     for (int s = 0; s < S; s++) {
         int pos = pos_base + s;
@@ -401,6 +519,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         free(gate);
     }
     mat_apply(out, ctx, &l->o, S);
+    if (l->lo) lora_apply(&l->lo->o, out, ctx, S, l->o.I, l->o.O);
     free(q); free(k); free(vv); free(ctx);
 }
 
@@ -497,8 +616,13 @@ static void mlp(Model *m, Layer *l, float *x, int S, float *out) {
     float *g = falloc((int64_t)S*I), *u = falloc((int64_t)S*I);
     mat_apply(g, x, &l->gate, S);
     mat_apply(u, x, &l->up,   S);
+    if (l->lo) {
+        lora_apply(&l->lo->gate, g, x, S, l->gate.I, l->gate.O);
+        lora_apply(&l->lo->up,   u, x, S, l->up.I,   l->up.O);
+    }
     for (int64_t i = 0; i < (int64_t)S*I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
     mat_apply(out, g, &l->down, S);
+    if (l->lo) lora_apply(&l->lo->down, out, g, S, l->down.I, l->down.O);  /* input = g fuso */
     free(g); free(u);
 }
 
@@ -532,6 +656,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     }
     float *logit = falloc(c->vocab);
     mat_apply(logit, last, &m->lm_head, 1);
+    lora_apply(&m->lm_lora, logit, last, 1, m->lm_head.I, m->lm_head.O);
     free(x); free(nrm); free(tmp); free(last);
     return logit;
 }

@@ -103,6 +103,75 @@ static int st_direct_fd(shards *S, int fd) {
     return -1;
 }
 
+/* indicizza UN file safetensors dentro S (gia' inizializzato): apre l'fd,
+ * parsa l'header JSON e accoda i tensori. Corpo per-file di st_init. */
+static void st_index_file(shards *S, const char *path) {
+    int fd = st_open_fd(S, path);
+    struct stat sst;
+    if (fstat(fd, &sst) != 0) { perror("fstat shard"); exit(1); }
+    int64_t fsz = (int64_t)sst.st_size;
+    uint64_t hlen;
+    if (pread(fd, &hlen, 8, 0) != 8) { perror("pread hlen"); exit(1); }
+    /* file malevolo/troncato: hlen deve stare nel file dopo gli 8 byte di
+     * prefisso e sotto il tetto. Senza questo bound hlen+1 puo' andare in
+     * overflow (malloc(0) e poi hdr[hlen]=0 fuori limiti) o forzare una
+     * malloc gigante. */
+    if (fsz < 8 || hlen > (uint64_t)(fsz - 8) || hlen > (uint64_t)ST_MAX_HEADER) {
+        fprintf(stderr, "%s: bad safetensors header length %llu (file %lld bytes)\n",
+                path, (unsigned long long)hlen, (long long)fsz); exit(1); }
+    char *hdr = malloc(hlen + 1);
+    if (!hdr) { perror("malloc safetensors header"); exit(1); }
+    if (pread(fd, hdr, hlen, 8) != (ssize_t)hlen) { perror("pread hdr"); exit(1); }
+    hdr[hlen] = 0;
+    int64_t data_start = 8 + (int64_t)hlen;
+    char *arena = NULL;
+    jval *root = json_parse(hdr, &arena);
+    if (!root || root->t != J_OBJ) {
+        fprintf(stderr, "%s: safetensors header is not a JSON object\n", path); exit(1); }
+    for (int i = 0; i < root->len; i++) {
+        const char *name = root->keys[i];
+        if (!strcmp(name, "__metadata__")) continue;
+        jval *m = root->kids[i];
+        jval *dt = json_get(m, "dtype");
+        jval *off = json_get(m, "data_offsets");
+        jval *shp = json_get(m, "shape");
+        /* un header crafted puo' omettere i campi o dare tipi sbagliati:
+         * senza questi guard si dereferenzia NULL (json_get) o si legge
+         * off->kids[0/1] oltre i limiti dell'array. */
+        if (!dt || dt->t != J_STR || !off || off->t != J_ARR || off->len < 2 ||
+            !shp || shp->t != J_ARR) {
+            fprintf(stderr, "%s: tensor '%s' has malformed dtype/data_offsets/shape\n",
+                    path, name); exit(1); }
+        int64_t a0 = (int64_t)off->kids[0]->num, b0 = (int64_t)off->kids[1]->num;
+        /* offset dichiarati dal file: non-negativi, ordinati e dentro al
+         * file. Altrimenti nbytes=b0-a0 diventa negativo -> malloc((size_t))
+         * gigante e la memcpy in st_read_f32 sfora il buffer del chiamante;
+         * oppure off punta fuori dal file. */
+        if (a0 < 0 || b0 < a0 || data_start + b0 > fsz) {
+            fprintf(stderr, "%s: tensor '%s' data_offsets [%lld,%lld] out of file bounds (%lld)\n",
+                    path, name, (long long)a0, (long long)b0, (long long)fsz); exit(1); }
+        int64_t numel = 1; for (int k = 0; k < shp->len; k++) numel *= (int64_t)shp->kids[k]->num;
+        if (S->n == S->cap) { S->cap *= 2; S->t = realloc(S->t, S->cap*sizeof(st_tensor)); }
+        st_tensor *t = &S->t[S->n++];
+        t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
+        t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
+    }
+    free(arena); /* i jval restano leakati: ok, una tantum all'avvio */
+    free(hdr);
+}
+
+/* indice hash costruito a fine indicizzazione (gli indici restano validi dopo i realloc) */
+static void st_hash_build(shards *S) {
+    S->hcap = 1; while (S->hcap < S->n * 2) S->hcap <<= 1;
+    S->hidx = malloc(S->hcap * sizeof(int));
+    for (int i = 0; i < S->hcap; i++) S->hidx[i] = -1;
+    for (int i = 0; i < S->n; i++) {
+        uint64_t h = st_hash(S->t[i].name) & (S->hcap - 1);
+        while (S->hidx[h] >= 0) h = (h + 1) & (S->hcap - 1);
+        S->hidx[h] = i;
+    }
+}
+
 /* indicizza tutti i model-*.safetensors in snap_dir */
 static void st_init(shards *S, const char *snap_dir) {
     memset(S, 0, sizeof(*S));
@@ -121,70 +190,16 @@ static void st_init(shards *S, const char *snap_dir) {
     closedir(d);
     for (int a = 0; a < nf; a++) for (int b = a+1; b < nf; b++)
         if (strcmp(files[a], files[b]) > 0) { char tmp[1024]; strcpy(tmp, files[a]); strcpy(files[a], files[b]); strcpy(files[b], tmp); }
+    for (int fi = 0; fi < nf; fi++) st_index_file(S, files[fi]);
+    st_hash_build(S);
+}
 
-    for (int fi = 0; fi < nf; fi++) {
-        int fd = st_open_fd(S, files[fi]);
-        struct stat sst;
-        if (fstat(fd, &sst) != 0) { perror("fstat shard"); exit(1); }
-        int64_t fsz = (int64_t)sst.st_size;
-        uint64_t hlen;
-        if (pread(fd, &hlen, 8, 0) != 8) { perror("pread hlen"); exit(1); }
-        /* file malevolo/troncato: hlen deve stare nel file dopo gli 8 byte di
-         * prefisso e sotto il tetto. Senza questo bound hlen+1 puo' andare in
-         * overflow (malloc(0) e poi hdr[hlen]=0 fuori limiti) o forzare una
-         * malloc gigante. */
-        if (fsz < 8 || hlen > (uint64_t)(fsz - 8) || hlen > (uint64_t)ST_MAX_HEADER) {
-            fprintf(stderr, "%s: bad safetensors header length %llu (file %lld bytes)\n",
-                    files[fi], (unsigned long long)hlen, (long long)fsz); exit(1); }
-        char *hdr = malloc(hlen + 1);
-        if (!hdr) { perror("malloc safetensors header"); exit(1); }
-        if (pread(fd, hdr, hlen, 8) != (ssize_t)hlen) { perror("pread hdr"); exit(1); }
-        hdr[hlen] = 0;
-        int64_t data_start = 8 + (int64_t)hlen;
-        char *arena = NULL;
-        jval *root = json_parse(hdr, &arena);
-        if (!root || root->t != J_OBJ) {
-            fprintf(stderr, "%s: safetensors header is not a JSON object\n", files[fi]); exit(1); }
-        for (int i = 0; i < root->len; i++) {
-            const char *name = root->keys[i];
-            if (!strcmp(name, "__metadata__")) continue;
-            jval *m = root->kids[i];
-            jval *dt = json_get(m, "dtype");
-            jval *off = json_get(m, "data_offsets");
-            jval *shp = json_get(m, "shape");
-            /* un header crafted puo' omettere i campi o dare tipi sbagliati:
-             * senza questi guard si dereferenzia NULL (json_get) o si legge
-             * off->kids[0/1] oltre i limiti dell'array. */
-            if (!dt || dt->t != J_STR || !off || off->t != J_ARR || off->len < 2 ||
-                !shp || shp->t != J_ARR) {
-                fprintf(stderr, "%s: tensor '%s' has malformed dtype/data_offsets/shape\n",
-                        files[fi], name); exit(1); }
-            int64_t a0 = (int64_t)off->kids[0]->num, b0 = (int64_t)off->kids[1]->num;
-            /* offset dichiarati dal file: non-negativi, ordinati e dentro al
-             * file. Altrimenti nbytes=b0-a0 diventa negativo -> malloc((size_t))
-             * gigante e la memcpy in st_read_f32 sfora il buffer del chiamante;
-             * oppure off punta fuori dal file. */
-            if (a0 < 0 || b0 < a0 || data_start + b0 > fsz) {
-                fprintf(stderr, "%s: tensor '%s' data_offsets [%lld,%lld] out of file bounds (%lld)\n",
-                        files[fi], name, (long long)a0, (long long)b0, (long long)fsz); exit(1); }
-            int64_t numel = 1; for (int k = 0; k < shp->len; k++) numel *= (int64_t)shp->kids[k]->num;
-            if (S->n == S->cap) { S->cap *= 2; S->t = realloc(S->t, S->cap*sizeof(st_tensor)); }
-            st_tensor *t = &S->t[S->n++];
-            t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
-            t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
-        }
-        free(arena); /* i jval restano leakati: ok, una tantum all'avvio */
-        free(hdr);
-    }
-    /* indice hash costruito a fine indicizzazione (gli indici restano validi dopo i realloc) */
-    S->hcap = 1; while (S->hcap < S->n * 2) S->hcap <<= 1;
-    S->hidx = malloc(S->hcap * sizeof(int));
-    for (int i = 0; i < S->hcap; i++) S->hidx[i] = -1;
-    for (int i = 0; i < S->n; i++) {
-        uint64_t h = st_hash(S->t[i].name) & (S->hcap - 1);
-        while (S->hidx[h] >= 0) h = (h + 1) & (S->hcap - 1);
-        S->hidx[h] = i;
-    }
+/* indicizza un SINGOLO file safetensors (es. adattatori LoRA in un file solo) */
+static void st_init_file(shards *S, const char *path) {
+    memset(S, 0, sizeof(*S));
+    S->cap = 4096; S->t = calloc(S->cap, sizeof(st_tensor));
+    st_index_file(S, path);
+    st_hash_build(S);
 }
 
 static st_tensor *st_find(shards *S, const char *name) {

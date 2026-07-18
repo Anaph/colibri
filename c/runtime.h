@@ -35,6 +35,11 @@ static void banner(Model *m);
 #ifndef ENGINE_OBSERVE
 #define ENGINE_OBSERVE(m, tok) ((void)0)
 #endif
+/* chiamato una volta dopo model_init+banner (sia REF che generazione):
+ * il motore puo' caricare stato extra (es. adattatori LoRA) */
+#ifndef ENGINE_POST_INIT
+#define ENGINE_POST_INIT(m) ((void)0)
+#endif
 
 /* ---------- config: range check ---------- */
 #define CKR(name, v, lo, hi) do { long _v=(long)(v); if(_v<(lo)||_v>(hi)){ \
@@ -347,6 +352,8 @@ static int engine_main(int argc, char **argv) {
     Model m;
     model_init_ex(&m, snap, qbits, budget, maxctx);
     banner(&m);
+    /* banner precede il ramo REF: l'hook gira UNA volta per entrambi i percorsi */
+    ENGINE_POST_INIT(&m);
     if (m.c.max_pos > 0 && maxctx > m.c.max_pos) maxctx = m.c.max_pos;
 
     const char *refpath = getenv("REF");
