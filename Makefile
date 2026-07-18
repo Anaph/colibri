@@ -1,4 +1,4 @@
-.PHONY: all glm portable test check cuda-test clean install uninstall
+.PHONY: all glm olmoe portable test check clean
 
-all glm portable test check cuda-test clean install uninstall:
+all glm olmoe portable test check clean:
 	$(MAKE) -C c $@
