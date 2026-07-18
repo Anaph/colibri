@@ -20,6 +20,10 @@ int qt_stw_st_parity(void);
 int qt_lora_zero_noop(void);
 int qt_lora_effect(void);
 int qt_lora_roundtrip(void);
+int qt_bw_rope_inv(void);
+int qt_bw_rmsnorm(void);
+int qt_grad_fd(void);
+int qt_train_descends(void);
 int qt_tta_off_bitexact(void);
 int qt_tta_cache_boost(void);
 int qt_tta_bias_direction(void);
@@ -47,6 +51,10 @@ C_TEST(QwenLora,     StwStParity,         qt_stw_st_parity)
 C_TEST(QwenLora,     ZeroBNoop,           qt_lora_zero_noop)
 C_TEST(QwenLora,     EffectMatchesRef,    qt_lora_effect)
 C_TEST(QwenLora,     Roundtrip,           qt_lora_roundtrip)
+C_TEST(QwenTrain,    RopeInverse,         qt_bw_rope_inv)
+C_TEST(QwenTrain,    RmsNormBackward,     qt_bw_rmsnorm)
+C_TEST(QwenTrain,    GradFiniteDiff,      qt_grad_fd)
+C_TEST(QwenTrain,    LossDescends,        qt_train_descends)
 C_TEST(QwenTta,      OffBitExact,         qt_tta_off_bitexact)
 C_TEST(QwenTta,      CacheBoost,          qt_tta_cache_boost)
 C_TEST(QwenTta,      BiasDirection,       qt_tta_bias_direction)

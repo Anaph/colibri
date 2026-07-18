@@ -699,6 +699,8 @@ static void banner(Model *m) {
             m->lm_tied ? " | lm_head=embed" : "", m->load_s, rss_gb(), IDOT_KERNEL, F32_KERNEL);
 }
 
+#include "qwen_train.h"
+
 #ifndef QWEN_TEST
 int main(int argc, char **argv) { return engine_main(argc, argv); }
 #endif /* QWEN_TEST */

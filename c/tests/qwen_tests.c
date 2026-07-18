@@ -512,7 +512,7 @@ int qt_stw_st_parity(void) {
 
 /* aggiunge uno slot base.A/base.B al writer; B a zero se zeroB; A[0] in *a0 */
 static void qt_lora_add(const char *base, int r, int I, int O, int zeroB, float *a0) {
-    char nm[220];
+    char nm[110];   /* < sizeof(StwT.name): niente warning di troncamento */
     float A[128], B[128];
     qt_fill(A, (int64_t)r*I, 0.5f);
     if (zeroB) memset(B, 0, sizeof(B)); else qt_fill(B, (int64_t)O*r, 0.5f);
@@ -603,7 +603,7 @@ int qt_lora_roundtrip(void) {
     static const int Os[7] = {32,16,16,16,32,32,16};
     qt_rng_s = 303;
     float a0[15]; int na = 0;
-    char base[160];
+    char base[96];
     for (int i = 0; i < 2; i++)
         for (int s = 0; s < 7; s++) {
             snprintf(base, sizeof(base), "lora.layers.%d.%s", i, subs[s]);
@@ -628,6 +628,137 @@ int qt_lora_roundtrip(void) {
         }
     }
     CHECK(m.lm_lora.r == 2 && m.lm_lora.alpha == 5.f && m.lm_lora.A[0] == a0[na]);
+    return 0;
+}
+
+/* ---- trainer: primitive backward e gradient-check ---- */
+
+/* rope seguito da rope inverso = identita' (anche con rotazione parziale) */
+int qt_bw_rope_inv(void) {
+    float x[8], x0[8];
+    qt_rng_s = 91;
+    for (int rot = 8; rot >= 4; rot -= 4) {
+        for (int i = 0; i < 8; i++) x[i] = x0[i] = qt_frnd();
+        rope_head(x, 13, 1000000.f, rot);
+        rope_head_inv(x, 13, 1000000.f, rot);
+        for (int i = 0; i < 8; i++) CHECK(fabsf(x[i] - x0[i]) < 1e-6f);
+    }
+    return 0;
+}
+
+/* riferimento double di sum_j dy_j * rmsnorm_j(x)*w_j */
+static double qt_rms_loss_ref(const double *x, const float *w, const float *dy, int D, double eps) {
+    double ms = 0; for (int i = 0; i < D; i++) ms += x[i]*x[i];
+    double r = 1.0 / sqrt(ms/D + eps);
+    double L = 0; for (int i = 0; i < D; i++) L += (double)dy[i] * x[i]*r*(double)w[i];
+    return L;
+}
+
+/* bw_rmsnorm contro finite-difference in double */
+int qt_bw_rmsnorm(void) {
+    int D = 16;
+    float x[16], w[16], dy[16], y[16], dx[16], r;
+    qt_rng_s = 92;
+    qt_fill(x, D, 1); qt_fill(w, D, 1); qt_fill(dy, D, 1);
+    t_rmsnorm_row(y, x, w, D, 1e-6f, &r);
+    memset(dx, 0, sizeof(dx));
+    bw_rmsnorm(dx, dy, x, w, r, D);
+    double xd[16]; for (int i = 0; i < D; i++) xd[i] = x[i];
+    for (int k = 0; k < 10; k++) {
+        int i = (k * 3) % D;
+        double eps = 1e-5, s = xd[i];
+        xd[i] = s + eps; double lp = qt_rms_loss_ref(xd, w, dy, D, 1e-6);
+        xd[i] = s - eps; double lm = qt_rms_loss_ref(xd, w, dy, D, 1e-6);
+        xd[i] = s;
+        double gfd = (lp - lm) / (2*eps);
+        double rel = fabs(gfd - (double)dx[i]) / fmax(1e-3, fabs(gfd) + fabs(dx[i]));
+        CHECK(rel < 1e-3);
+    }
+    return 0;
+}
+
+/* setup comune del trainer sui due layer del modello tiny */
+static Model qt_train_m;
+static LStash qt_train_st[2];
+static LoraLayer *qt_train_gl;
+static Lora qt_train_gh;
+
+static void qt_train_setup(int S, int head, int maxt) {
+    const char *dir = tst_dir("qwen_tiny_model");
+    qt_write_dense_dir(dir);
+    model_init(&qt_train_m, dir, 0);
+    kv_alloc(&qt_train_m, maxt);
+    train_guard(&qt_train_m, 0);
+    lora_train_alloc(&qt_train_m, 0, 2, 4.f, head);
+    memset(&qt_train_gh, 0, sizeof(qt_train_gh));
+    qt_train_gl = lora_grad_alloc(&qt_train_m, 0, head ? &qt_train_gh : NULL);
+    t_params_build(&qt_train_m, 0, qt_train_gl, head ? &qt_train_gh : NULL);
+    lstash_alloc(&qt_train_st[0], &qt_train_m.c, S);
+    lstash_alloc(&qt_train_st[1], &qt_train_m.c, S);
+}
+
+/* IL gate del trainer: ogni parametro adattatore contro central finite
+ * difference. B randomizzati (con B=0 i gradienti su A sarebbero nulli). */
+int qt_grad_fd(void) {
+    qt_train_setup(5, 1, 8);
+    Model *m = &qt_train_m;
+    qt_rng_s = 505;
+    for (int p = 0; p < t_npar; p++)
+        for (int64_t i = 0; i < t_par[p].n; i++) t_par[p].w[i] += qt_frnd() * 0.3f;
+    int ids[5];
+    qt_rng_s = 606;
+    for (int i = 0; i < 5; i++) ids[i] = 1 + (int)((qt_frnd() + 0.5f) * 30.99f);
+    t_grads_zero();
+    train_loss_and_backward(m, ids, 5, 0, qt_train_st, qt_train_gl, &qt_train_gh);
+    double maxrel = 0; int nch = 0;
+    /* eps 1e-2 (non 1e-3): il forward e' in float, la loss ha ~1e-6 di rumore
+     * e con eps piu' piccolo il rumore/(2*eps) supera la tolleranza sui
+     * gradienti piccoli. L'errore di troncamento O(eps^2) resta trascurabile. */
+    const float eps = 1e-2f;
+    for (int p = 0; p < t_npar; p++) {
+        for (int64_t i = 0; i < t_par[p].n; i++) {
+            float w0 = t_par[p].w[i];
+            t_par[p].w[i] = w0 + eps;
+            double lp = train_loss_and_backward(m, ids, 5, 0, qt_train_st, NULL, NULL);
+            t_par[p].w[i] = w0 - eps;
+            double lm = train_loss_and_backward(m, ids, 5, 0, qt_train_st, NULL, NULL);
+            t_par[p].w[i] = w0;
+            double gfd = (lp - lm) / (2.0 * eps);
+            double gan = t_par[p].g[i];
+            double rel = fabs(gfd - gan) / fmax(1e-3, fabs(gfd) + fabs(gan));
+            if (rel > maxrel) maxrel = rel;
+            nch++;
+            /* doppio criterio: errore relativo E assoluto. Il pavimento
+             * assoluto 5e-4 (~10x il rumore FD) evita falsi negativi sui
+             * gradienti minuscoli; un errore di formula vero sposta interi
+             * tensori ben oltre entrambe le soglie. */
+            if (rel >= 1e-2 && fabs(gfd - gan) >= 5e-4) {
+                fprintf(stderr, "grad-fd: par %d el %lld: an=%.6g fd=%.6g rel=%.3g\n",
+                        p, (long long)i, gan, gfd, rel);
+                return 1;
+            }
+        }
+    }
+    fprintf(stderr, "grad-fd: %d parametri verificati, max rel err %.3g\n", nch, maxrel);
+    return 0;
+}
+
+/* 20 step AdamW su una finestra: la loss deve scendere nettamente */
+int qt_train_descends(void) {
+    qt_train_setup(16, 0, 24);
+    Model *m = &qt_train_m;
+    int ids[16];
+    for (int i = 0; i < 16; i++) ids[i] = 1 + (i % 7);
+    double first = 0, last = 0;
+    for (int it = 1; it <= 20; it++) {
+        t_grads_zero();
+        double L = train_loss_and_backward(m, ids, 16, 0, qt_train_st, qt_train_gl, NULL);
+        if (it == 1) first = L;
+        last = L;
+        t_adamw_all(1e-2f, 0.f, it);
+    }
+    fprintf(stderr, "train-descends: loss %.4f -> %.4f\n", first, last);
+    CHECK(last < first * 0.9 && last < first);
     return 0;
 }
 
