@@ -511,4 +511,111 @@ static void t_adamw_all(float lr, float wd, int t) {
         adamw_step(t_par[p].w, t_par[p].g, &t_par[p].a, t_par[p].n, lr, wd, t);
 }
 
+/* ---------- salvataggio adattatori (nomi identici a quelli di lora_load) ---------- */
+static void lora_save(Model *m, int L0, float alpha, const char *path) {
+    char nm[110];   /* < sizeof(StwT.name): niente troncamento */
+    for (int i = L0; i < m->c.n_layers; i++) {
+        Layer *l = &m->L[i];
+        if (!l->lo) continue;
+        #define SF(fld, sub, I_, O_) do { if (l->lo->fld.r) { \
+            int64_t shA[2] = {l->lo->fld.r, (I_)}, shB[2] = {(O_), l->lo->fld.r}; \
+            snprintf(nm, sizeof(nm), "lora.layers.%d." sub ".A", i); stw_add(nm, 2, shA, l->lo->fld.A); \
+            snprintf(nm, sizeof(nm), "lora.layers.%d." sub ".B", i); stw_add(nm, 2, shB, l->lo->fld.B); } } while (0)
+        LORA_SLOTS(m, l, SF);
+        #undef SF
+    }
+    if (m->lm_lora.r) {
+        int64_t shA[2] = {m->lm_lora.r, m->c.hidden}, shB[2] = {m->c.vocab, m->lm_lora.r};
+        stw_add("lora.lm_head.A", 2, shA, m->lm_lora.A);
+        stw_add("lora.lm_head.B", 2, shB, m->lm_lora.B);
+    }
+    int64_t s1[1] = {1};
+    stw_add("lora.alpha", 1, s1, &alpha);
+    stw_write(path);
+}
+
+/* ---------- TRAIN mode: fine-tuning LoRA su un corpus di testo ----------
+ * Attivato da TRAIN=<corpus.txt> (vedi main di qwen.c). Env:
+ *   TRAIN_CTX=512 TRAIN_STRIDE=CTX TRAIN_EPOCHS=1 TRAIN_LR=1e-4 TRAIN_WD=0
+ *   TRAIN_CE_CHUNK=32 LORA_RANK=8 LORA_ALPHA=2*rank LORA_LAYERS=4 LORA_HEAD=0
+ *   LORA_OUT=lora.safetensors; LORA=<file> = warm start dagli adattatori. */
+static int train_main(int argc, char **argv) {
+    (void)argc;
+    omp_hot_tune(argv);
+    const char *th_ = getenv("THREADS");
+    if (th_ && atoi(th_) > 0) omp_set_num_threads(atoi(th_));
+    const char *snap = getenv("SNAP");
+    if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
+    const char *corpus = getenv("TRAIN");
+    if (!corpus || !*corpus) { fprintf(stderr, "set TRAIN=<corpus.txt>\n"); return 1; }
+    int ctx     = getenv("TRAIN_CTX")    ? atoi(getenv("TRAIN_CTX"))    : 512;
+    int stride  = getenv("TRAIN_STRIDE") ? atoi(getenv("TRAIN_STRIDE")) : ctx;
+    int epochs  = getenv("TRAIN_EPOCHS") ? atoi(getenv("TRAIN_EPOCHS")) : 1;
+    float lr    = getenv("TRAIN_LR") ? (float)atof(getenv("TRAIN_LR")) : 1e-4f;
+    float wd    = getenv("TRAIN_WD") ? (float)atof(getenv("TRAIN_WD")) : 0.f;
+    if (getenv("TRAIN_CE_CHUNK")) t_ce_chunk = atoi(getenv("TRAIN_CE_CHUNK"));
+    int rank    = getenv("LORA_RANK")   ? atoi(getenv("LORA_RANK"))   : 8;
+    float alpha = getenv("LORA_ALPHA")  ? (float)atof(getenv("LORA_ALPHA")) : 2.f*rank;
+    int nadapt  = getenv("LORA_LAYERS") ? atoi(getenv("LORA_LAYERS")) : 4;
+    int head    = getenv("LORA_HEAD")   ? atoi(getenv("LORA_HEAD"))   : 0;
+    const char *out = getenv("LORA_OUT") ? getenv("LORA_OUT") : "lora.safetensors";
+    if (ctx < 8 || stride < 1 || epochs < 1) { fprintf(stderr, "[train] TRAIN_CTX/STRIDE/EPOCHS invalidi\n"); return 1; }
+    if (rank < 1 || rank > LORA_MAX_R) { fprintf(stderr, "[train] LORA_RANK fuori range [1,%d]\n", LORA_MAX_R); return 1; }
+    Model m;
+    model_init(&m, snap, 0);
+    banner(&m);
+    int L0 = m.c.n_layers - nadapt; if (L0 < 0) L0 = 0;
+    train_guard(&m, L0);
+    /* tokenizza l'intero corpus */
+    char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
+    Tok T; tok_load(&T, tokpath);
+    FILE *f = fopen(corpus, "rb"); if (!f) { perror(corpus); return 1; }
+    fseek(f, 0, SEEK_END); long fsz = ftell(f); fseek(f, 0, SEEK_SET);
+    char *txt = malloc(fsz + 1);
+    if (!txt || fread(txt, 1, fsz, f) != (size_t)fsz) { fprintf(stderr, "[train] lettura corpus fallita\n"); return 1; }
+    txt[fsz] = 0; fclose(f);
+    int *ids = malloc(((int64_t)fsz + 16) * sizeof(int));
+    int nids = tok_encode(&T, txt, (int)fsz, ids, (int)fsz + 16);
+    free(txt);
+    fprintf(stderr, "[train] corpus %s: %ld byte, %d token; finestre da %d (stride %d), %d epoche\n",
+            corpus, fsz, nids, ctx, stride, epochs);
+    if (nids < 8) { fprintf(stderr, "[train] corpus troppo corto (<8 token)\n"); return 1; }
+    kv_alloc(&m, ctx);
+    /* adattatori: warm start da LORA= se impostato, altrimenti init nuovo */
+    if (getenv("LORA") && *getenv("LORA")) {
+        lora_load(&m);
+        for (int i = L0; i < m.c.n_layers; i++)
+            if (!m.L[i].lo) { fprintf(stderr, "[train] warm start: manca l'adattatore del layer %d\n", i); return 1; }
+        if (head && !m.lm_lora.r) { fprintf(stderr, "[train] warm start: manca lora.lm_head\n"); return 1; }
+        if (m.L[L0].lo->q.r) alpha = m.L[L0].lo->q.alpha;
+    } else {
+        lora_train_alloc(&m, L0, rank, alpha, head);
+    }
+    Lora gHead; memset(&gHead, 0, sizeof(gHead));
+    LoraLayer *gL = lora_grad_alloc(&m, L0, head ? &gHead : NULL);
+    t_params_build(&m, L0, gL, head ? &gHead : NULL);
+    LStash *st = malloc((m.c.n_layers - L0) * sizeof(LStash));
+    for (int i = 0; i < m.c.n_layers - L0; i++) lstash_alloc(&st[i], &m.c, ctx);
+    int wtot = 0;
+    for (int off = 0; off + 8 <= nids; off += stride) wtot++;
+    int adam_t = 0;
+    for (int ep = 0; ep < epochs; ep++) {
+        int wi = 0;
+        for (int off = 0; off + 8 <= nids; off += stride) {   /* finestre <8 token saltate */
+            int S = nids - off < ctx ? nids - off : ctx;
+            m.kv_len = 0;
+            double t0 = now_s();
+            t_grads_zero();
+            double loss = train_loss_and_backward(&m, ids + off, S, L0, st, gL, head ? &gHead : NULL);
+            t_adamw_all(lr, wd, ++adam_t);
+            double dt = now_s() - t0;
+            fprintf(stderr, "[train] epoch %d finestra %d/%d loss %.4f (%.1f tok/s)\n",
+                    ep + 1, ++wi, wtot, loss, S / (dt > 1e-9 ? dt : 1e-9));
+        }
+    }
+    lora_save(&m, L0, alpha, out);
+    fprintf(stderr, "[train] adattatori salvati in %s\n", out);
+    return 0;
+}
+
 #endif /* QWEN_TRAIN_H */

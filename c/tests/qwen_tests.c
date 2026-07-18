@@ -762,6 +762,45 @@ int qt_train_descends(void) {
     return 0;
 }
 
+/* ---- end-to-end: loop di training su corpus sintetico + adattatori riusabili ----
+ * Guida direttamente il loop a finestre (niente train_main: nessun fixture
+ * tokenizer), poi salva con lora_save e ricarica in un modello fresco. */
+int qt_train_e2e(void) {
+    qt_train_setup(16, 0, 24);
+    Model *m = &qt_train_m;
+    int ids[200];
+    for (int i = 0; i < 200; i++) ids[i] = (i % 7) + 1;
+    double first = 0, lastm = 0;
+    int t = 0;
+    for (int ep = 0; ep < 3; ep++) {
+        double sum = 0; int nw = 0;
+        for (int off = 0; off + 8 <= 200; off += 16) {
+            int S = 200 - off < 16 ? 200 - off : 16;
+            m->kv_len = 0;
+            t_grads_zero();
+            sum += train_loss_and_backward(m, ids + off, S, 0, qt_train_st, qt_train_gl, NULL);
+            t_adamw_all(1e-2f, 0.f, ++t);
+            nw++;
+        }
+        if (ep == 0) first = sum / nw;
+        lastm = sum / nw;
+    }
+    fprintf(stderr, "train-e2e: loss media epoca %.4f -> %.4f\n", first, lastm);
+    CHECK(lastm < first);
+    /* salvataggio con lo stesso percorso del trainer, poi ricarica da zero */
+    const char *tmp = getenv("TMPDIR"); if (!tmp) tmp = "/tmp";
+    char lp[600]; snprintf(lp, sizeof(lp), "%s/qwen_lora_e2e.safetensors", tmp);
+    lora_save(m, 0, 4.f, lp);
+    const char *dir = tst_dir("qwen_tiny_model");
+    float *base = qt_lora_step3(dir, NULL);
+    float *with = qt_lora_step3(dir, lp);
+    int diff = 0;
+    for (int v = 0; v < 32; v++) { CHECK(isfinite(with[v])); if (base[v] != with[v]) diff = 1; }
+    CHECK(diff);
+    free(base); free(with);
+    return 0;
+}
+
 /* ---- TTA sperimentale: cache neurale e bias sui logit ---- */
 
 /* protocollo di gen_turn guidato a mano: step -> adjust -> (prob del vero

@@ -702,5 +702,9 @@ static void banner(Model *m) {
 #include "qwen_train.h"
 
 #ifndef QWEN_TEST
-int main(int argc, char **argv) { return engine_main(argc, argv); }
+int main(int argc, char **argv) {
+    /* TRAIN=<corpus.txt> -> fine-tuning LoRA (qwen_train.h) invece della generazione */
+    if (getenv("TRAIN") && *getenv("TRAIN")) return train_main(argc, argv);
+    return engine_main(argc, argv);
+}
 #endif /* QWEN_TEST */

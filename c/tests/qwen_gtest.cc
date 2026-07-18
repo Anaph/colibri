@@ -24,6 +24,7 @@ int qt_bw_rope_inv(void);
 int qt_bw_rmsnorm(void);
 int qt_grad_fd(void);
 int qt_train_descends(void);
+int qt_train_e2e(void);
 int qt_tta_off_bitexact(void);
 int qt_tta_cache_boost(void);
 int qt_tta_bias_direction(void);
@@ -55,6 +56,7 @@ C_TEST(QwenTrain,    RopeInverse,         qt_bw_rope_inv)
 C_TEST(QwenTrain,    RmsNormBackward,     qt_bw_rmsnorm)
 C_TEST(QwenTrain,    GradFiniteDiff,      qt_grad_fd)
 C_TEST(QwenTrain,    LossDescends,        qt_train_descends)
+C_TEST(QwenTrain,    EndToEnd,            qt_train_e2e)
 C_TEST(QwenTta,      OffBitExact,         qt_tta_off_bitexact)
 C_TEST(QwenTta,      CacheBoost,          qt_tta_cache_boost)
 C_TEST(QwenTta,      BiasDirection,       qt_tta_bias_direction)
