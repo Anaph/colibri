@@ -431,8 +431,16 @@ static void deltanet_token(Model *m, Layer *l, const float *x, float *out) {
     mat_apply(z,   x, &l->az,   1);
     mat_apply(b,   x, &l->ab,   1);
     mat_apply(a,   x, &l->aa,   1);
+    float *q = qkv, *k = qkv + kd, *v = qkv + 2*kd;
+    float qscale = 1.f / sqrtf((float)dk);
+    float *o = falloc(vd);
+    /* UNA sola regione parallela per token: conv -> (single) l2norm/scala ->
+     * ricorrenza, con le barriere implicite dei for a fare da sincronia.
+     * Corpi dei cicli identici alla versione a regioni separate. */
+    #pragma omp parallel
+    {
     /* conv1d causale depthwise sul solo qkv (z passa fuori), poi silu */
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (int ch = 0; ch < cd; ch++) {
         float *cs = l->conv_state + (int64_t)ch*K;
         memmove(cs, cs+1, (K-1)*sizeof(float));
@@ -442,15 +450,14 @@ static void deltanet_token(Model *m, Layer *l, const float *x, float *out) {
         if (l->conv_b) v += l->conv_b[ch];
         qkv[ch] = v * sigmoidf(v);          /* silu */
     }
-    float *q = qkv, *k = qkv + kd, *v = qkv + 2*kd;
-    float qscale = 1.f / sqrtf((float)dk);
+    /* blocco seriale (pochi elementi): un solo thread, gli altri aspettano */
+    #pragma omp single
     for (int h = 0; h < Hk; h++) {
         l2norm_head(q + (int64_t)h*dk, dk);
         l2norm_head(k + (int64_t)h*dk, dk);
         for (int i = 0; i < dk; i++) q[(int64_t)h*dk + i] *= qscale;
     }
-    float *o = falloc(vd);
-    #pragma omp parallel for schedule(static)
+    #pragma omp for schedule(static)
     for (int hv = 0; hv < Hv; hv++) {
         int hk = hv / R;                    /* testa k condivisa (Hv/Hk teste v per testa k) */
         const float *qh = q + (int64_t)hk*dk, *kh = k + (int64_t)hk*dk, *vh = v + (int64_t)hv*dv;
@@ -471,6 +478,7 @@ static void deltanet_token(Model *m, Layer *l, const float *x, float *out) {
         const float *zh = z + (int64_t)hv*dv;
         for (int j = 0; j < dv; j++) oh[j] = oh[j]*r*l->dn_norm[j] * (zh[j]*sigmoidf(zh[j]));
     }
+    }   /* fine regione parallela */
     mat_apply(out, o, &l->aout, 1);
     free(qkv); free(z); free(b); free(a); free(o);
 }
