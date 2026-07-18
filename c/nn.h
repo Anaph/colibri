@@ -38,51 +38,27 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
         const float *w = W + (int64_t)o * I;
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s * I;
-            float acc = 0.f;
-            for (int i = 0; i < I; i++) acc += xs[i] * w[i];
-            y[(int64_t)s * O + o] = acc;
+            y[(int64_t)s * O + o] = dot_f32(xs, w, I);
         }
     }
 }
 
-/* y[1,O] = x[1,I] @ W^T con W int8 + scala per riga (stessa via di olmoe.c) */
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
-    int32x4_t acc = vdupq_n_s32(0);
-    int8x16_t va = vld1q_s8(a), vb = vld1q_s8(b);
-#if defined(__ARM_FEATURE_DOTPROD)
-    acc = vdotq_s32(acc, va, vb);
-#else
-    acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(va),  vget_low_s8(vb)));
-    acc = vpadalq_s16(acc, vmull_s8(vget_high_s8(va), vget_high_s8(vb)));
-#endif
-    return vaddvq_s32(acc);
-}
-#endif
+/* y[1,O] = x[1,I] @ W^T con W int8 + scala per riga: schema Q8_0 di glm.c su
+ * TUTTE le piattaforme (attivazione quantizzata per riga, dot INTERO via
+ * dot_i8i8). xi vive sullo stack del thread chiamante ed e' letto in
+ * condivisione dentro la regione omp: nessuna copia per thread. */
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
-#if defined(__ARM_NEON)
     static int idot = -1;
     if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
-    if (idot && I % 16 == 0 && I <= NN_QROW_MAX) {
-        int nb = I / 16; int8_t xi[NN_QROW_MAX]; float xs[NN_QROW_MAX/16];
-        for (int b = 0; b < nb; b++) {
-            const float *xb = x + b*16;
-            float am = 0.f; for (int i = 0; i < 16; i++) { float a = fabsf(xb[i]); if (a > am) am = a; }
-            float s = am/127.f; if (s < 1e-12f) s = 1e-12f;
-            xs[b] = s; float inv = 1.f/s;
-            for (int i = 0; i < 16; i++) xi[b*16+i] = (int8_t)lrintf(xb[i]*inv);
-        }
+    if (idot && I <= NN_QROW_MAX) {
+        int8_t xi[NN_QROW_MAX];
+        float sx = qrow_i8(x, xi, I);
         #pragma omp parallel for schedule(static)
-        for (int o = 0; o < O; o++) {
-            const int8_t *w = q + (int64_t)o * I;
-            float acc = 0.f;
-            for (int b = 0; b < nb; b++) acc += xs[b]*(float)dot_i8_16(xi+b*16, w+b*16);
-            y[o] = acc * scale[o];
-        }
+        for (int o = 0; o < O; o++)
+            y[o] = scale[o] * sx * (float)dot_i8i8(q + (int64_t)o*I, xi, I);
         return;
     }
-#endif
+    /* IDOT=0: percorso esatto f32*int8, invariato */
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; o++) {
         const int8_t *w = q + (int64_t)o * I;

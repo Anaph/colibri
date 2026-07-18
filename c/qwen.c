@@ -277,8 +277,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
                 const float *qv = q + s*qw + (int64_t)hh*hd;
                 for (int t = 0; t <= qpos; t++) {
                     const float *kr = m->K[layer] + ((int64_t)kvh*m->max_t + t)*hd;
-                    float acc = 0; for (int dd = 0; dd < hd; dd++) acc += qv[dd]*kr[dd];
-                    sc[t] = acc * scale;
+                    sc[t] = dot_f32(qv, kr, hd) * scale;
                 }
                 softmax_row(sc, qpos+1);
                 float *cx = ctx + s*qw + (int64_t)hh*hd;
@@ -356,19 +355,11 @@ static void deltanet_token(Model *m, Layer *l, const float *x, float *out) {
         float dec  = expf(g);
         float kv[MAX_LIN_DV], delta[MAX_LIN_DV]; /* dv <= MAX_LIN_DV garantito dal check in load_cfg */
         for (int j = 0; j < dv; j++) kv[j] = 0;
-        for (int i = 0; i < dk; i++) {
-            float *Si = S + (int64_t)i*dv;
-            float ki = kh[i];
-            for (int j = 0; j < dv; j++) { Si[j] *= dec; kv[j] += Si[j]*ki; }
-        }
+        for (int i = 0; i < dk; i++) dn_row_decay_acc(S + (int64_t)i*dv, dec, kh[i], kv, dv);
         for (int j = 0; j < dv; j++) delta[j] = (vh[j] - kv[j]) * beta;
         float *oh = o + (int64_t)hv*dv;
         for (int j = 0; j < dv; j++) oh[j] = 0;
-        for (int i = 0; i < dk; i++) {
-            float *Si = S + (int64_t)i*dv;
-            float ki = kh[i], qi = qh[i];
-            for (int j = 0; j < dv; j++) { Si[j] += ki*delta[j]; oh[j] += Si[j]*qi; }
-        }
+        for (int i = 0; i < dk; i++) dn_row_update_dot(S + (int64_t)i*dv, kh[i], delta, qh[i], oh, dv);
         /* rmsnorm gated per testa: norm(o)*w * silu(z) */
         double ms = 0; for (int j = 0; j < dv; j++) ms += (double)oh[j]*oh[j];
         float r = 1.f / sqrtf((float)(ms/dv) + c->eps);
@@ -459,9 +450,9 @@ static void stops_seed(Model *m, Tok *T) {
 
 static void banner(Model *m) {
     int nlin = 0; for (int i = 0; i < m->c.n_layers; i++) nlin += (m->c.ltype[i] == LT_LINEAR);
-    fprintf(stderr, "[qwen] %d layer (%d deltanet), hidden %d, %d/%d teste (hd %d, rot %d), inter %d, vocab %d%s | load %.1fs | RSS %.2f GB\n",
+    fprintf(stderr, "[qwen] %d layer (%d deltanet), hidden %d, %d/%d teste (hd %d, rot %d), inter %d, vocab %d%s | load %.1fs | RSS %.2f GB | idot %s | f32 %s\n",
             m->c.n_layers, nlin, m->c.hidden, m->c.n_heads, m->c.n_kv_heads, m->c.head_dim, m->c.rot, m->c.inter, m->c.vocab,
-            m->lm_tied ? " | lm_head=embed" : "", m->load_s, rss_gb());
+            m->lm_tied ? " | lm_head=embed" : "", m->load_s, rss_gb(), IDOT_KERNEL, F32_KERNEL);
 }
 
 #ifndef QWEN_TEST

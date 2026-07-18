@@ -372,8 +372,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
                 const float *qv = q + s*qw + (int64_t)hh*hd;
                 for (int t = t0; t <= qpos; t++) {
                     const float *kr = Kc + ((int64_t)kvh*m->max_t + t)*hd;
-                    float acc = 0; for (int dd = 0; dd < hd; dd++) acc += qv[dd]*kr[dd];
-                    sc[t-t0] = acc * scale;
+                    sc[t-t0] = dot_f32(qv, kr, hd) * scale;
                 }
                 softmax_row(sc, qpos-t0+1);
                 float *cx = ctx + s*qw + (int64_t)hh*hd;
@@ -537,13 +536,13 @@ static void stops_seed(Model *m, Tok *T) {
 
 static void banner(Model *m) {
     int nfull = 0; for (int i = 0; i < m->c.n_layers; i++) nfull += (m->c.ltype[i] == LT_FULL);
-    fprintf(stderr, "[gemma] %d layer (%d full/%d sliding, finestra %d), hidden %d, %d teste (hd %d/%d, rot %d), vocab %d%s%s%s | load %.1fs | RSS %.2f GB\n",
+    fprintf(stderr, "[gemma] %d layer (%d full/%d sliding, finestra %d), hidden %d, %d teste (hd %d/%d, rot %d), vocab %d%s%s%s | load %.1fs | RSS %.2f GB | idot %s | f32 %s\n",
             m->c.n_layers, nfull, m->c.n_layers-nfull, m->c.window, m->c.hidden, m->c.n_heads,
             m->c.head_dim, m->c.ghd, m->c.rot_angles, m->c.vocab,
             m->lm_tied ? " | lm_head=embed" : "",
             m->c.n_kv_shared ? " | kv-shared" : "",
             m->c.ple_dim ? " | PLE" : "",
-            m->load_s, rss_gb());
+            m->load_s, rss_gb(), IDOT_KERNEL, F32_KERNEL);
 }
 
 #ifndef GEMMA_TEST
