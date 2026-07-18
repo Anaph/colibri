@@ -18,6 +18,9 @@
 /* peso denso: f32 oppure int8+scala per riga (QBITS=8) */
 typedef struct { float *f; int8_t *q; float *qs; int O, I; } Mat;
 
+/* tetto sulla riga di attivazione quantizzabile al volo in matmul_q */
+#define NN_QROW_MAX 16384
+
 /* ---------- utility ---------- */
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
 #if defined(__APPLE__)
@@ -60,8 +63,8 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
 #if defined(__ARM_NEON)
     static int idot = -1;
     if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
-    if (idot && I % 16 == 0 && I <= 16384) {
-        int nb = I / 16; int8_t xi[16384]; float xs[1024];
+    if (idot && I % 16 == 0 && I <= NN_QROW_MAX) {
+        int nb = I / 16; int8_t xi[NN_QROW_MAX]; float xs[NN_QROW_MAX/16];
         for (int b = 0; b < nb; b++) {
             const float *xb = x + b*16;
             float am = 0.f; for (int i = 0; i < 16; i++) { float a = fabsf(xb[i]); if (a > am) am = a; }

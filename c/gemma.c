@@ -40,6 +40,14 @@
 #define ENGINE_TAG "gemma"
 #define ENGINE_EOT "<end_of_turn>\n"
 
+/* tipi di layer (valori del config: layer_types). Attenzione alla polarita':
+ * in gemma 1 = full_attention, in qwen 1 = linear_attention. */
+enum { LT_SLIDING = 0, LT_FULL = 1 };
+
+/* tetto su hidden_size_per_layer_input: dimensiona il buffer su stack di
+ * ple_inputs, garantito dal check in load_cfg */
+#define MAX_PLE_DIM 1024
+
 /* ---------- config (config.json HF, text_config) ---------- */
 typedef struct {
     int hidden, n_layers, n_heads, n_kv_heads, head_dim, inter, vocab, max_pos;
@@ -56,12 +64,12 @@ typedef struct {
     int n_kv_shared;            /* num_kv_shared_layers */
     int ple_dim, ple_vocab;     /* hidden_size_per_layer_input / vocab per-layer */
     int eos[4], n_eos;
-    int *ltype;                 /* [n_layers] 1=full_attention 0=sliding_attention */
+    int *ltype;                 /* [n_layers] LT_FULL / LT_SLIDING */
     int *kv_src;                /* [n_layers] layer sorgente del K/V (se' stesso se non condiviso) */
 } Cfg;
 
 typedef struct {
-    int type;                   /* 1=full 0=sliding */
+    int type;                   /* LT_FULL / LT_SLIDING */
     int shared_kv;              /* riusa K/V del layer kv_src (proiezioni k/v assenti) */
     float *in_ln, *post_attn_ln, *pre_ff_ln, *post_ff_ln;
     float *qn, *kn, *vn;        /* per testa, lunghezza hd del layer; vn opzionale */
@@ -135,12 +143,12 @@ static void load_cfg(Cfg *c, const char *snap) {
     jval *lt = json_get(r,"layer_types");
     if (lt && lt->t==J_ARR) {
         for (int i = 0; i < c->n_layers && i < lt->len; i++)
-            c->ltype[i] = (lt->kids[i]->t==J_STR && !strcmp(lt->kids[i]->str,"full_attention")) ? 1 : 0;
+            c->ltype[i] = (lt->kids[i]->t==J_STR && !strcmp(lt->kids[i]->str,"full_attention")) ? LT_FULL : LT_SLIDING;
     } else {
         jval *pat = json_get(r,"sliding_window_pattern");
         int per = pat ? (int)pat->num : 6;
-        for (int i = 0; i < c->n_layers; i++) c->ltype[i] = ((i+1) % per) ? 0 : 1;
-        c->ltype[c->n_layers-1] = 1;
+        for (int i = 0; i < c->n_layers; i++) c->ltype[i] = ((i+1) % per) ? LT_SLIDING : LT_FULL;
+        c->ltype[c->n_layers-1] = LT_FULL;
     }
     /* KV-sharing: gli ultimi n_kv_shared layer prendono il K/V dell'ultimo layer
      * NON condiviso dello stesso tipo */
@@ -158,7 +166,7 @@ static void load_cfg(Cfg *c, const char *snap) {
     CKR("global_head_dim",      c->ghd,        2, 1024);
     CKR("sliding_window",       c->window,     1, 1<<20);
     CKR("num_kv_shared_layers", c->n_kv_shared, 0, c->n_layers-1);
-    if (c->ple_dim) CKR("hidden_size_per_layer_input", c->ple_dim, 1, 1024);
+    if (c->ple_dim) CKR("hidden_size_per_layer_input", c->ple_dim, 1, MAX_PLE_DIM);
     if (c->n_heads % c->n_gkv) {
         fprintf(stderr,"config: n_heads non divisibile per le teste kv\n"); exit(1);
     }
@@ -190,8 +198,8 @@ static const char *probe_name(Model *m, char *buf, int cap, int required, int n,
 static int layer_matrefs(Model *m, int li, MatRef *r) {
     Cfg *c = &m->c; Layer *l = &m->L[li];
     int n = 0, D = c->hidden;
-    int hd = l->type ? c->ghd : c->head_dim;
-    int KV = l->type ? c->n_gkv : c->n_kv_heads;
+    int hd = l->type == LT_FULL ? c->ghd : c->head_dim;
+    int KV = l->type == LT_FULL ? c->n_gkv : c->n_kv_heads;
     int H = c->n_heads;
     #define MR(field, fmt, O_, I_) do { r[n].mat=&l->field; \
         snprintf(r[n].name,sizeof(r[n].name),"model.layers.%d." fmt,li); \
@@ -234,7 +242,7 @@ static void load_small(Model *m) {
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
         l->type = c->ltype[i];
-        int hd = l->type ? c->ghd : c->head_dim;
+        int hd = l->type == LT_FULL ? c->ghd : c->head_dim;
         #define LDT(field, suffix, n_) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm,n_)
         LDT(in_ln,        "input_layernorm.weight", D);
         LDT(post_attn_ln, "post_attention_layernorm.weight", D);
@@ -264,8 +272,8 @@ static int64_t fixed_bytes(Model *m, int ctx) {
                            + (int64_t)c->n_layers*c->ple_dim*c->hidden*4;
     for (int i = 0; i < c->n_layers; i++) {
         if (c->kv_src[i] != i) continue;
-        int hd = c->ltype[i] ? c->ghd : c->head_dim;
-        int KV = c->ltype[i] ? c->n_gkv : c->n_kv_heads;
+        int hd = c->ltype[i] == LT_FULL ? c->ghd : c->head_dim;
+        int KV = c->ltype[i] == LT_FULL ? c->n_gkv : c->n_kv_heads;
         b += (int64_t)2 * KV * ctx * hd * 4;
     }
     return b;
@@ -298,11 +306,11 @@ static void gemma_rope_head(float *x, int pos, float theta, int hd, int rot_angl
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     Cfg *c = &m->c;
     int H = c->n_heads;
-    int hd = l->type ? c->ghd : c->head_dim;
-    int KV = l->type ? c->n_gkv : c->n_kv_heads;
+    int hd = l->type == LT_FULL ? c->ghd : c->head_dim;
+    int KV = l->type == LT_FULL ? c->n_gkv : c->n_kv_heads;
     int G = H / KV;
-    float theta = l->type ? c->theta_g : c->theta_l;
-    int rot = l->type ? c->rot_angles : hd/2;        /* sliding: RoPE pieno */
+    float theta = l->type == LT_FULL ? c->theta_g : c->theta_l;
+    int rot = l->type == LT_FULL ? c->rot_angles : hd/2;        /* sliding: RoPE pieno */
     int src = c->kv_src[layer];
     int64_t qw = (int64_t)H*hd, kw = (int64_t)KV*hd;
     float *q = falloc(S*qw);
@@ -360,7 +368,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             for (int s = 0; s < S; s++) {
                 int kvh = hh / G;
                 int qpos = pos_base + s;
-                int t0 = l->type ? 0 : (qpos - c->window + 1 > 0 ? qpos - c->window + 1 : 0);
+                int t0 = l->type == LT_FULL ? 0 : (qpos - c->window + 1 > 0 ? qpos - c->window + 1 : 0);
                 const float *qv = q + s*qw + (int64_t)hh*hd;
                 for (int t = t0; t <= qpos; t++) {
                     const float *kr = Kc + ((int64_t)kvh*m->max_t + t)*hd;
@@ -420,7 +428,7 @@ static void ple_inputs(Model *m, const int *ids, int S, float *out /*[S, n_layer
             float *op = os + (int64_t)li*P;
             const float *pp = proj + (int64_t)li*P;
             /* norma del contesto (VERIFY: norm su ple_dim per layer) */
-            float tmp[1024];
+            float tmp[MAX_PLE_DIM];
             for (int j = 0; j < P; j++) tmp[j] = pp[j]*inv_sqrt_d;
             if (m->ple_proj_norm) {
                 double ms=0; for (int j=0;j<P;j++) ms += (double)tmp[j]*tmp[j];
@@ -507,8 +515,8 @@ static void kv_alloc(Model *m, int max_t) {
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++) {
         if (c->kv_src[i] != i) continue;           /* i layer kv-shared leggono dal sorgente */
-        int hd = c->ltype[i] ? c->ghd : c->head_dim;
-        int KV = c->ltype[i] ? c->n_gkv : c->n_kv_heads;
+        int hd = c->ltype[i] == LT_FULL ? c->ghd : c->head_dim;
+        int KV = c->ltype[i] == LT_FULL ? c->n_gkv : c->n_kv_heads;
         m->K[i] = falloc((int64_t)KV * max_t * hd);
         m->V[i] = falloc((int64_t)KV * max_t * hd);
     }
@@ -528,7 +536,7 @@ static void stops_seed(Model *m, Tok *T) {
 }
 
 static void banner(Model *m) {
-    int nfull = 0; for (int i = 0; i < m->c.n_layers; i++) nfull += m->c.ltype[i];
+    int nfull = 0; for (int i = 0; i < m->c.n_layers; i++) nfull += (m->c.ltype[i] == LT_FULL);
     fprintf(stderr, "[gemma] %d layer (%d full/%d sliding, finestra %d), hidden %d, %d teste (hd %d/%d, rot %d), vocab %d%s%s%s | load %.1fs | RSS %.2f GB\n",
             m->c.n_layers, nfull, m->c.n_layers-nfull, m->c.window, m->c.hidden, m->c.n_heads,
             m->c.head_dim, m->c.ghd, m->c.rot_angles, m->c.vocab,

@@ -76,11 +76,11 @@ int gm_sliding(void) {
     m.c.head_dim=hd; m.c.ghd=hd; m.c.rot_angles=hd/2;
     m.c.theta_g=1e6f; m.c.theta_l=1e4f; m.c.eps=1e-6f; m.c.n_layers=1; m.c.window=W;
     m.c.zc_norm=0;                                  /* pesi=1 -> norma pura, piu' semplice per il ref */
-    static int lt[1] = {0};                          /* sliding */
+    static int lt[1] = {LT_SLIDING};
     static int ks[1] = {0};
     m.c.ltype = lt; m.c.kv_src = ks;
     Layer l; memset(&l,0,sizeof l);
-    l.type = 0;
+    l.type = LT_SLIDING;
     l.q.f=falloc((int64_t)H*hd*D);  l.q.O=H*hd;  l.q.I=D;
     l.k.f=falloc((int64_t)KV*hd*D); l.k.O=KV*hd; l.k.I=D;
     l.v.f=falloc((int64_t)KV*hd*D); l.v.O=KV*hd; l.v.I=D;
@@ -201,7 +201,7 @@ static int gm_run8(const char *dir, int qbits, int *out, int expect_shared, int 
     Model m;
     model_init(&m, dir, qbits);
     CHECK(m.lm_tied);
-    CHECK(m.c.ltype[2] == 1 && m.c.ltype[0] == 0 && m.c.ltype[3] == 0);
+    CHECK(m.c.ltype[2] == LT_FULL && m.c.ltype[0] == LT_SLIDING && m.c.ltype[3] == LT_SLIDING);
     CHECK(m.c.rot_angles == 1);                    /* int(0.25*8)/2 */
     if (expect_shared) {
         CHECK(m.c.kv_src[3] == 1);                 /* ultimo sliding condivide col layer 1 (sliding) */

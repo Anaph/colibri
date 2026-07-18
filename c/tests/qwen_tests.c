@@ -45,7 +45,7 @@ int qt_gqa(void) {
     Model A, B; memset(&A,0,sizeof A); memset(&B,0,sizeof B);
     A.c.hidden=D; A.c.n_heads=H; A.c.n_kv_heads=KV; A.c.head_dim=hd; A.c.rot=hd;
     A.c.theta=1e6f; A.c.eps=1e-6f; A.c.n_layers=1;
-    static int lt[1] = {0}; A.c.ltype = lt;
+    static int lt[1] = {LT_FULL}; A.c.ltype = lt;
     B.c = A.c; B.c.n_kv_heads = H;
     Layer la, lb; memset(&la,0,sizeof la); memset(&lb,0,sizeof lb);
     la.q.f=falloc((int64_t)H*hd*D);  la.q.O=H*hd;  la.q.I=D;
@@ -125,7 +125,7 @@ int qt_gated_layout(void) {
     Model A, B; memset(&A,0,sizeof A); memset(&B,0,sizeof B);
     A.c.hidden=D; A.c.n_heads=H; A.c.n_kv_heads=KV; A.c.head_dim=hd; A.c.rot=hd/2; /* esercita il partial rope */
     A.c.theta=1e6f; A.c.eps=1e-6f; A.c.n_layers=1;
-    static int lt[1] = {0}; A.c.ltype = lt;
+    static int lt[1] = {LT_FULL}; A.c.ltype = lt;
     B.c = A.c;
     Layer la, lb; memset(&la,0,sizeof la); memset(&lb,0,sizeof lb);
     la.q.f=falloc((int64_t)H*hd*D);  la.q.O=H*hd;  la.q.I=D;
@@ -248,7 +248,7 @@ static int qt_deltanet_case(int D, int Hv, int Hk, int dk, int dv, int K, int T)
     m.c.hidden = D; m.c.eps = 1e-6f;
     m.c.lin_hv = Hv; m.c.lin_hk = Hk; m.c.lin_dk = dk; m.c.lin_dv = dv; m.c.lin_conv = K;
     Layer l; memset(&l,0,sizeof l);
-    l.type = 1;
+    l.type = LT_LINEAR;
     #define MKM(mat, src, O_, I_) do { l.mat.O=O_; l.mat.I=I_; l.mat.q=NULL; l.mat.qs=NULL; \
         l.mat.f=falloc((int64_t)(O_)*(I_)); for (int64_t _i=0;_i<(int64_t)(O_)*(I_);_i++) l.mat.f[_i]=(float)src[_i]; } while(0)
     MKM(aqkv, W_qkv, cd, D);
@@ -371,7 +371,7 @@ static int qt_run8(const char *dir, int qbits, int hybrid, int *out) {
     CHECK(m.c.head_dim == 8);
     CHECK(m.c.hybrid == hybrid);
     if (hybrid) {
-        CHECK(m.L[0].type == 1 && m.L[1].type == 0);
+        CHECK(m.L[0].type == LT_LINEAR && m.L[1].type == LT_FULL);
         CHECK(m.L[1].gated);
         CHECK(m.c.rot == 4);
     }

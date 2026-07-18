@@ -25,6 +25,14 @@
 #define ENGINE_TAG "qwen"
 #define ENGINE_EOT "<|im_end|>\n"
 
+/* tipi di layer (valori del config: layer_types). Attenzione alla polarita':
+ * in qwen 1 = linear_attention, in gemma 1 = full_attention. */
+enum { LT_FULL = 0, LT_LINEAR = 1 };
+
+/* tetto sui head_dim della parte lineare: dimensiona i buffer su stack di
+ * deltanet_token, garantito dal check in load_cfg */
+#define MAX_LIN_DV 1024
+
 /* ---------- config (config.json HF di Qwen3 / Qwen3.5) ---------- */
 typedef struct {
     int hidden, n_layers, n_heads, n_kv_heads, head_dim, inter, vocab, max_pos;
@@ -38,11 +46,11 @@ typedef struct {
     int lin_hv, lin_hk;         /* teste value / key della parte lineare */
     int lin_dk, lin_dv;         /* head_dim key / value della parte lineare */
     int lin_conv;               /* kernel della conv1d causale */
-    int *ltype;                 /* [n_layers] 0=full_attention 1=linear_attention */
+    int *ltype;                 /* [n_layers] LT_FULL / LT_LINEAR */
 } Cfg;
 
 typedef struct {
-    int type;                              /* 0=full_attention 1=linear_attention */
+    int type;                              /* LT_FULL / LT_LINEAR */
     float *in_ln, *post_ln;
     /* full attention (anche gated: q_proj raddoppiato con il gate per testa) */
     int gated;
@@ -100,16 +108,16 @@ static void load_cfg(Cfg *c, const char *snap) {
     jval *lt = json_get(r,"layer_types");
     if (lt && lt->t==J_ARR) {
         for (int i = 0; i < c->n_layers && i < lt->len; i++)
-            c->ltype[i] = (lt->kids[i]->t==J_STR && !strcmp(lt->kids[i]->str,"linear_attention")) ? 1 : 0;
+            c->ltype[i] = (lt->kids[i]->t==J_STR && !strcmp(lt->kids[i]->str,"linear_attention")) ? LT_LINEAR : LT_FULL;
     } else if (c->lin_hv > 0) {
         jval *fi = json_get(r,"full_attention_interval");
         int interval = fi ? (int)fi->num : 4;
-        for (int i = 0; i < c->n_layers; i++) c->ltype[i] = ((i+1) % interval) ? 1 : 0;
+        for (int i = 0; i < c->n_layers; i++) c->ltype[i] = ((i+1) % interval) ? LT_LINEAR : LT_FULL;
     }
     c->hybrid = 0;
-    for (int i = 0; i < c->n_layers; i++) if (c->ltype[i]) c->hybrid = 1;
+    for (int i = 0; i < c->n_layers; i++) if (c->ltype[i] == LT_LINEAR) c->hybrid = 1;
     if (c->hybrid && (c->lin_hv<=0 || c->lin_hk<=0 || c->lin_dk<=0 || c->lin_dv<=0 ||
-                      c->lin_dk>1024 || c->lin_dv>1024 ||
+                      c->lin_dk>MAX_LIN_DV || c->lin_dv>MAX_LIN_DV ||
                       c->lin_hv % c->lin_hk || c->lin_conv<1 || c->lin_conv>8)) {
         fprintf(stderr,"config: parametri linear_attention mancanti o incoerenti\n"); exit(1);
     }
@@ -123,7 +131,7 @@ static int layer_matrefs(Model *m, int li, MatRef *r) {
     #define MR(field, fmt, O_, I_) do { r[n].mat=&l->field; \
         snprintf(r[n].name,sizeof(r[n].name),"model.layers.%d." fmt,li); \
         r[n].O=(O_); r[n].I=(I_); n++; } while(0)
-    if (l->type == 0) {
+    if (l->type == LT_FULL) {
         MR(q, "self_attn.q_proj.weight", l->gated ? 2*H*hd : H*hd, D);
         MR(k, "self_attn.k_proj.weight", KV*hd, D);
         MR(v, "self_attn.v_proj.weight", KV*hd, D);
@@ -154,7 +162,7 @@ static void load_small(Model *m) {
         #define LDT(field, suffix, n_) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm,n_)
         LDT(in_ln,  "input_layernorm.weight", D);
         LDT(post_ln,"post_attention_layernorm.weight", D);
-        if (l->type == 0) {
+        if (l->type == LT_FULL) {
             LDT(qn, "self_attn.q_norm.weight", hd);  /* per testa, NON per hidden */
             LDT(kn, "self_attn.k_norm.weight", hd);
             /* Qwen3.5: q_proj raddoppiato = [query|gate]. Rilevato dalla forma. */
@@ -179,7 +187,7 @@ static void load_small(Model *m) {
 /* parte fissa del budget specifica del motore: KV-cache dei layer full */
 static int64_t fixed_bytes(Model *m, int ctx) {
     Cfg *c = &m->c;
-    int nfull = 0; for (int i = 0; i < c->n_layers; i++) if (!c->ltype[i]) nfull++;
+    int nfull = 0; for (int i = 0; i < c->n_layers; i++) if (c->ltype[i] == LT_FULL) nfull++;
     return (int64_t)nfull * 2 * c->n_kv_heads * ctx * c->head_dim * 4;
 }
 
@@ -189,7 +197,7 @@ static void state_reset(Model *m) {
     if (!m->L || !c->hybrid) return;
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
-        if (l->type != 1) continue;
+        if (l->type != LT_LINEAR) continue;
         int cd = 2*c->lin_hk*c->lin_dk + c->lin_hv*c->lin_dv;
         memset(l->conv_state, 0, (int64_t)cd*c->lin_conv*sizeof(float));
         memset(l->Sstate, 0, (int64_t)c->lin_hv*c->lin_dk*c->lin_dv*sizeof(float));
@@ -346,7 +354,7 @@ static void deltanet_token(Model *m, Layer *l, const float *x, float *out) {
         float g    = -expf(l->A_log[hv]) * softplusf(a[hv] + l->dt_bias[hv]);
         float beta = sigmoidf(b[hv]);
         float dec  = expf(g);
-        float kv[1024], delta[1024];        /* dv <= 1024 garantito dal CKR */
+        float kv[MAX_LIN_DV], delta[MAX_LIN_DV]; /* dv <= MAX_LIN_DV garantito dal check in load_cfg */
         for (int j = 0; j < dv; j++) kv[j] = 0;
         for (int i = 0; i < dk; i++) {
             float *Si = S + (int64_t)i*dv;
@@ -406,7 +414,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
             if (i + 1 < c->n_layers && i + 1 >= m->n_resident) layer_prefetch(m, i + 1);
         }
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
-        if (l->type == 1) deltanet(m, l, nrm, S, tmp);
+        if (l->type == LT_LINEAR) deltanet(m, l, nrm, S, tmp);
         else attention(m, l, i, nrm, S, pos_base, tmp);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
@@ -427,7 +435,7 @@ static void kv_alloc(Model *m, int max_t) {
     m->max_t = max_t; m->kv_len = 0;
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++) {
-        if (c->ltype[i]) continue;         /* i layer lineari usano lo stato, non la KV */
+        if (c->ltype[i] == LT_LINEAR) continue;  /* i layer lineari usano lo stato, non la KV */
         m->K[i] = falloc((int64_t)c->n_kv_heads * max_t * c->head_dim);
         m->V[i] = falloc((int64_t)c->n_kv_heads * max_t * c->head_dim);
     }
@@ -450,7 +458,7 @@ static void stops_seed(Model *m, Tok *T) {
 }
 
 static void banner(Model *m) {
-    int nlin = 0; for (int i = 0; i < m->c.n_layers; i++) nlin += m->c.ltype[i];
+    int nlin = 0; for (int i = 0; i < m->c.n_layers; i++) nlin += (m->c.ltype[i] == LT_LINEAR);
     fprintf(stderr, "[qwen] %d layer (%d deltanet), hidden %d, %d/%d teste (hd %d, rot %d), inter %d, vocab %d%s | load %.1fs | RSS %.2f GB\n",
             m->c.n_layers, nlin, m->c.hidden, m->c.n_heads, m->c.n_kv_heads, m->c.head_dim, m->c.rot, m->c.inter, m->c.vocab,
             m->lm_tied ? " | lm_head=embed" : "", m->load_s, rss_gb());
