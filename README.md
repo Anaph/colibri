@@ -55,6 +55,34 @@ Common environment variables (qwen engine):
 | `REF` | — | ref.json with prompt_ids/full_ids for greedy validation |
 | `TOKENS` | 0 | 1 → dump generated token ids to stderr |
 
+## Qwen engine notes
+
+`qwen` runs two architecture families from the same binary, selected by the
+model's config.json:
+
+- **Qwen3 dense** (0.6B–32B): GQA attention with per-head QK-RMSNorm, RoPE
+  (theta from config), SwiGLU MLP, tied embeddings where the checkpoint uses
+  them.
+- **Qwen3.5 hybrid** (Qwen3-Next lineage, e.g. Qwen3.5-4B): `layer_types`
+  mixes **Gated DeltaNet** linear-attention layers (recurrent state instead of
+  a KV cache — memory does not grow with context) with **Gated Attention**
+  full-attention layers (output gate, partial RoPE).
+
+Memory: a 4B model needs ~16 GB RAM at f32; `QBITS=8` halves twice (~4.5 GB).
+In chat mode the recurrent DeltaNet state is append-only: editing history
+requires a full conversation reset (the engine does this automatically when
+the context fills up).
+
+### Validating against transformers
+
+Token-parity validation needs a reference run from a machine with network
+access and `transformers` installed:
+
+```
+python3 c/tests/make_ref.py Qwen/Qwen3-0.6B "The capital of France is" 24 > ref_qwen.json
+REF=ref_qwen.json SNAP=/path/to/Qwen3-0.6B ./c/qwen     # expects full token match at f32
+```
+
 ## Layout
 
 ```
