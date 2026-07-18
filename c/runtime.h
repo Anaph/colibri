@@ -117,6 +117,33 @@ static void load_mat(Model *m, Mat *w, const char *name, int O, int I) {
     }
 }
 
+/* embed int8 per riga (QBITS=8): letto e quantizzato A BLOCCHI di righe, il
+ * picco transiente e' un blocco f32 e non l'intera tabella (622 MB gia' a
+ * 0.6B). quantize_rows lavora per riga, quindi il risultato e' bit-identico
+ * alla quantizzazione one-shot della tabella intera. Il blocco e' una
+ * variabile solo perche' i test lo stringono per esercitare il loop. */
+static int g_embed_chunk_rows = 8192;
+static void load_embed_q8(Model *m) {
+    Cfg *c = &m->c; int D = c->hidden; int64_t V = c->vocab;
+    int64_t n = st_numel(&m->S, "model.embed_tokens.weight");
+    if (n != V*D) {
+        fprintf(stderr, "tensor model.embed_tokens.weight: numel %lld != atteso %lld\n",
+                (long long)n, (long long)(V*D));
+        exit(1);
+    }
+    m->embed_q  = malloc(V*D);
+    m->embed_qs = falloc(V);
+    if (!m->embed_q) { fprintf(stderr, "OOM quant embed\n"); exit(1); }
+    int rows = g_embed_chunk_rows; if (rows < 1) rows = 1;
+    float *scratch = falloc((int64_t)rows*D);
+    for (int64_t v = 0; v < V; v += rows) {
+        int64_t r = V - v < rows ? V - v : rows;
+        st_read_slice_f32(&m->S, "model.embed_tokens.weight", v*D, r*D, scratch, 0);
+        quantize_rows(scratch, m->embed_q + v*D, m->embed_qs + v, (int)r, D, 8);
+    }
+    free(scratch);
+}
+
 static int64_t layer_f32_bytes(Model *m, int li) {
     MatRef r[MAX_LAYER_MATS]; int n = layer_matrefs(m, li, r);
     int64_t b = 0;
@@ -235,9 +262,13 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
         exit(1);
 #endif
     }
-    m->embed = load_t(m, "model.embed_tokens.weight", (int64_t)c->vocab*D);
+    /* QBITS=8 copre anche l'embed: 4x meno RAM sulla voce residente piu'
+     * grande e, con lm_head tied, il GEMV piu' grosso del decode passa al
+     * kernel int8 (stessa classe di errore delle altre matrici quantizzate) */
+    if (m->qbits == 8) load_embed_q8(m);
+    else m->embed = load_t(m, "model.embed_tokens.weight", (int64_t)c->vocab*D);
     if (m->lm_tied) {
-        m->lm_head.f = m->embed; m->lm_head.q=NULL; m->lm_head.qs=NULL;
+        m->lm_head.f = m->embed; m->lm_head.q = m->embed_q; m->lm_head.qs = m->embed_qs;
         m->lm_head.sh=NULL; m->lm_head.sname=NULL;
         m->lm_head.O = c->vocab; m->lm_head.I = D;
     } else {
@@ -246,8 +277,11 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
     /* 2) budget -> quanti layer di matrici stanno residenti */
     m->n_resident = c->n_layers;
     if (budget_bytes > 0) {
-        int64_t fixed = ((int64_t)c->vocab*D + D)*4;                /* embed + final_norm */
-        if (!m->lm_tied) fixed += (int64_t)c->vocab*D*4;
+        /* embed (e l'eventuale lm_head separato): f32 oppure int8+scala */
+        int64_t vd = (m->qbits == 8) ? (int64_t)c->vocab*D + (int64_t)c->vocab*4
+                                     : (int64_t)c->vocab*D*4;
+        int64_t fixed = vd + (int64_t)D*4;                          /* + final_norm */
+        if (!m->lm_tied) fixed += vd;
         fixed += (int64_t)c->n_layers * 8 * D * 4;                  /* norme/vettori: stima larga */
         fixed += fixed_bytes(m, ctx_hint > 0 ? ctx_hint : 4096);    /* hook: KV, PLE... */
         int64_t used = fixed + max_lb;                              /* scratch di streaming */

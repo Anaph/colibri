@@ -81,6 +81,7 @@ typedef struct {
     shards S;
     int qbits;
     float *embed, *final_norm;
+    int8_t *embed_q; float *embed_qs;      /* QBITS=8: embed int8 per riga (embed=NULL) */
     Mat lm_head; int lm_tied;
     Lora lm_lora;                          /* adattatore LoRA sull'lm_head (r=0 = spento) */
     Layer *L;
@@ -700,9 +701,13 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     float *x = falloc((int64_t)S*D);
     for (int s = 0; s < S; s++) {
-        if (m->embed)                              /* micro-RSS: embed NON residente */
+        if (m->embed)
             memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
-        else                                       /* gather della sola riga richiesta (drop=0: righe calde minuscole) */
+        else if (m->embed_q) {                     /* QBITS=8: dequant della riga */
+            const int8_t *er = m->embed_q + (int64_t)ids[s]*D;
+            float es = m->embed_qs[ids[s]], *xs = x + (int64_t)s*D;
+            for (int i = 0; i < D; i++) xs[i] = er[i] * es;
+        } else                                     /* micro-RSS: gather della sola riga dal disco (drop=0: righe calde minuscole) */
             st_read_slice_f32(&m->S, "model.embed_tokens.weight", (int64_t)ids[s]*D, D, x + (int64_t)s*D, 0);
     }
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);

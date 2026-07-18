@@ -85,6 +85,7 @@ typedef struct {
     shards S;
     int qbits;
     float *embed, *final_norm;
+    int8_t *embed_q; float *embed_qs;      /* QBITS=8: embed int8 per riga (embed=NULL) */
     Mat lm_head; int lm_tied;
     Layer *L;
     /* PLE globali */
@@ -415,7 +416,13 @@ static void ple_inputs(Model *m, const int *ids, int S, float *out /*[S, n_layer
     for (int s = 0; s < S; s++) {
         int id = ids[s] < c->ple_vocab ? ids[s] : 0;
         /* contesto: proiezione dell'embedding principale scalato */
-        for (int i = 0; i < D; i++) xemb[i] = m->embed[(int64_t)id*D + i] * emb_scale;
+        if (m->embed)
+            for (int i = 0; i < D; i++) xemb[i] = m->embed[(int64_t)id*D + i] * emb_scale;
+        else {                                    /* QBITS=8: dequant della riga */
+            const int8_t *er = m->embed_q + (int64_t)id*D;
+            float es = m->embed_qs[id] * emb_scale;
+            for (int i = 0; i < D; i++) xemb[i] = er[i] * es;
+        }
         mat_apply(proj, xemb, &m->ple_model_proj, 1);
         const float *pe = m->ple_embed + (int64_t)id*NL*P;
         float *os = out + (int64_t)s*NL*P;
@@ -458,9 +465,16 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     float emb_scale = sqrtf((float)D);
     float *x = falloc((int64_t)S*D);
-    for (int s = 0; s < S; s++)
-        for (int i = 0; i < D; i++)
-            x[(int64_t)s*D + i] = m->embed[(int64_t)ids[s]*D + i] * emb_scale;
+    for (int s = 0; s < S; s++) {
+        float *xs = x + (int64_t)s*D;
+        if (m->embed)
+            for (int i = 0; i < D; i++) xs[i] = m->embed[(int64_t)ids[s]*D + i] * emb_scale;
+        else {                                    /* QBITS=8: dequant della riga */
+            const int8_t *er = m->embed_q + (int64_t)ids[s]*D;
+            float es = m->embed_qs[ids[s]] * emb_scale;
+            for (int i = 0; i < D; i++) xs[i] = er[i] * es;
+        }
+    }
     float *ple = NULL;
     if (c->ple_dim > 0) {
         ple = falloc((int64_t)S*c->n_layers*c->ple_dim);

@@ -79,7 +79,7 @@ Common environment variables (qwen engine):
 | `TEMP` / `NUCLEUS` / `SEED` | 0.7 / 0.95 | sampling (TEMP=0 → greedy) |
 | `CHAT_TEMPLATE` | 1 | wrap prompt in the model's chat format |
 | `THINK` | 0 | Qwen3 thinking mode (0 pre-closes the think block) |
-| `QBITS` | 0 | 8 → int8-quantize weights at load (~2.5× less RAM) |
+| `QBITS` | 0 | 8 → int8-quantize weights **and embeddings** at load (~4× less RAM); a tied lm_head runs the int8 kernel too |
 | `THREADS` | — | cap the OpenMP team; overrides `OMP_NUM_THREADS`; applied before load |
 | `MEM_GB` | — | RAM budget in GiB: layers beyond the budget stream from disk each step |
 | `MEM_FRAC` | — | same budget as a fraction (0..1) of total physical RAM; `MEM_GB` wins |
@@ -167,7 +167,9 @@ model's config.json:
   a KV cache — memory does not grow with context) with **Gated Attention**
   full-attention layers (output gate, partial RoPE).
 
-Memory: a 4B model needs ~16 GB RAM at f32; `QBITS=8` halves twice (~4.5 GB).
+Memory: a 4B model needs ~16 GB RAM at f32; `QBITS=8` quantizes everything
+including the embedding table (~4 GB, loaded chunk-wise so the peak never
+spikes above the final footprint).
 In chat mode the recurrent DeltaNet state is append-only: editing history
 requires a full conversation reset (the engine does this automatically when
 the context fills up).

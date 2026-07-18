@@ -516,6 +516,34 @@ static int qt_run8_micro(const char *dir, int *out) {
     return 0;
 }
 
+/* ---- QBITS=8 quantizza anche l'embed: loader a blocchi bit-identico alla
+ * quantizzazione one-shot dell'intera tabella, tied lm_head sul kernel int8 ---- */
+int qt_embed_q8(void) {
+    const char *dir = tst_dir("qwen_tiny_model");
+    qt_write_dense_dir(dir);
+    int save = g_embed_chunk_rows;
+    g_embed_chunk_rows = 5;             /* vocab=32: 7 blocchi, resto compreso */
+    Model m;
+    model_init(&m, dir, 8);
+    g_embed_chunk_rows = save;
+    CHECK(m.embed == NULL && m.embed_q != NULL && m.embed_qs != NULL);
+    CHECK(m.lm_tied && m.lm_head.q == m.embed_q && m.lm_head.qs == m.embed_qs && m.lm_head.f == NULL);
+    int V = m.c.vocab, D = m.c.hidden;
+    float *ref = falloc((int64_t)V*D);
+    st_read_f32(&m.S, "model.embed_tokens.weight", ref, 0);
+    int8_t *rq = malloc((size_t)V*D); float *rs = falloc(V);
+    quantize_rows(ref, rq, rs, V, D, 8);
+    CHECK(memcmp(rq, m.embed_q, (size_t)V*D) == 0);
+    CHECK(memcmp(rs, m.embed_qs, (size_t)V*sizeof(float)) == 0);
+    free(ref); free(rq); free(rs);
+    /* generazione deterministica sul percorso embed int8 (gather = dequant) */
+    int a[16], b[16];
+    CHECK(qt_run8(dir, 8, 0, a) == 0);
+    CHECK(qt_run8(dir, 8, 0, b) == 0);
+    for (int i = 0; i < 11; i++) CHECK(a[i] == b[i]);
+    return 0;
+}
+
 int qt_micro_parity(void) {
     /* tst_dir ritorna un buffer statico: copie locali obbligatorie */
     char dense[512], hyb[512];

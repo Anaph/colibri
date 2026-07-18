@@ -71,7 +71,14 @@ Container: 4 shared cores, AVX512-VNNI, portable-build kernels for the table
    batched `mlp()` removes S× region re-forks per layer on top.
 5. **DeltaNet single region**: conv + recurrence share one parallel region
    per token (was two). Minor; taken because it is free.
-6. **Micro-RSS mode** (`MICRO=1`, qwen) — the opposite trade: minimum
+6. **int8 embeddings under `QBITS=8`** — the embedding table used to stay
+   f32 resident, so with a tied lm_head the largest single GEMV of decode
+   (V×D: 622 MB at 0.6B, 1.5 GB at 4B) still streamed f32 bytes after every
+   other matrix was quantized. Now the table is quantized per-row at load
+   (chunk-wise, so the load transient is one chunk, not the table), the
+   input gather dequantizes one row, and the tied head runs the int8 kernel:
+   decode bytes/token at `QBITS=8` are now genuinely ~4× below f32.
+7. **Micro-RSS mode** (`MICRO=1`, qwen) — the opposite trade: minimum
    resident memory instead of maximum speed. No weight is resident (embedding
    rows gathered per token, every GEMV re-reads its matrix in constant 4 MB
    chunks, page cache dropped after use); output stays bit-identical to the
