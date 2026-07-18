@@ -30,6 +30,28 @@ cmake ≥ 3.24 and a C++ compiler for the GoogleTest harness (test logic itself
 is plain C; the C++ is confined to thin gtest glue). The first configure
 downloads a pinned gtest via FetchContent unless a system GTest is installed.
 
+## SIMD
+
+The shared kernels in `c/simd.h` are selected at compile time by `-march`
+(one `#ifdef` ladder, no runtime CPUID dispatch):
+
+| Build | f32 kernel | int8 kernel |
+| --- | --- | --- |
+| `make portable` (x86-64-v3) | AVX2+FMA | AVX2 (maddubs) |
+| `make portable-v4` (x86-64-v4) | AVX512F | AVX2 (v4 has no VNNI) |
+| `make` / `ARCH=native` (x86) | AVX512F where present | +AVX512-VNNI on supporting CPUs |
+| ARM (NEON baseline) | NEON | NEON; +dotprod (SDOT) with `ARCH=native` on supporting cores |
+
+Quantized matmuls (`QBITS=8`) run the per-row Q8_0 scheme: activations are
+quantized to int8 per row and the dot is pure integer (`dot_i8i8`). `IDOT=0`
+selects the exact f32×int8 path instead — use it for byte-exact `REF`
+comparisons (olmoe now shares the same int8 scheme, so its numerics also
+shift slightly unless `IDOT=0`). The engines print the compiled tiers in
+their startup banner (`idot ... | f32 ...`).
+
+`make test-native` builds and runs the test suite with `-march=native`, so
+the reference-based tests exercise the SIMD kernels your CPU actually has.
+
 ## Run
 
 Each engine is driven by environment variables and reads a HuggingFace

@@ -10,6 +10,7 @@ c/gemma.exe
 
 # build separata dei test (cmake + gtest)
 c/tests/build/
+c/tests/build-native/
 
 # pesi modello / artefatti di run
 *.safetensors

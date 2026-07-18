@@ -144,6 +144,19 @@ endif
 portable:
 	$(MAKE) all ARCH=$(PORTABLE_ARCH)
 
+# x86 AVX-512 tier of the portable binary: x86-64-v4 = AVX512F/BW/CD/DQ/VL
+# (dot_f32 avx512f) ma NON AVX512-VNNI (int8 resta sul tier AVX2; VNNI solo
+# con ARCH=native su CPU che la supporta).
+portable-v4:
+	$(MAKE) all ARCH=x86-64-v4
+
+# test suite compilata con -march=native: esercita i kernel SIMD reali
+TESTS_BUILD_NATIVE ?= tests/build-native
+test-native:
+	cmake -S tests -B $(TESTS_BUILD_NATIVE) -DCOLIBRI_TEST_MARCH=native
+	cmake --build $(TESTS_BUILD_NATIVE) -j
+	ctest --test-dir $(TESTS_BUILD_NATIVE) --output-on-failure
+
 # GoogleTest suite: separate CMake build path (engines stay on plain make).
 # First configure downloads a pinned gtest via FetchContent unless a system
 # GTest is found.
@@ -162,5 +175,6 @@ check:
 clean:
 	rm -f glm glm.exe olmoe olmoe.exe qwen qwen.exe gemma gemma.exe
 	rm -rf $(TESTS_BUILD)
+	rm -rf $(TESTS_BUILD_NATIVE)
 
-.PHONY: all glm olmoe qwen gemma portable test check clean
+.PHONY: all glm olmoe qwen gemma portable portable-v4 test test-native check clean
