@@ -43,7 +43,9 @@ static void fill(float *p, int64_t n, float sc) { for (int64_t i = 0; i < n; i++
 static int test_gqa(void) {
     int D = 16, H = 4, KV = 2, hd = 8, G = H/KV, S = 5;
     Model A, B; memset(&A,0,sizeof A); memset(&B,0,sizeof B);
-    A.c.hidden=D; A.c.n_heads=H; A.c.n_kv_heads=KV; A.c.head_dim=hd; A.c.theta=1e6f; A.c.eps=1e-6f; A.c.n_layers=1;
+    A.c.hidden=D; A.c.n_heads=H; A.c.n_kv_heads=KV; A.c.head_dim=hd; A.c.rot=hd;
+    A.c.theta=1e6f; A.c.eps=1e-6f; A.c.n_layers=1;
+    static int lt[1] = {0}; A.c.ltype = lt;
     B.c = A.c; B.c.n_kv_heads = H;
     Layer la, lb; memset(&la,0,sizeof la); memset(&lb,0,sizeof lb);
     la.q.f=falloc((int64_t)H*hd*D);  la.q.O=H*hd;  la.q.I=D;

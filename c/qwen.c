@@ -24,20 +24,41 @@
 #include "st.h"
 #include "tok.h"
 
-/* ---------- config (config.json HF di Qwen3) ---------- */
+/* ---------- config (config.json HF di Qwen3 / Qwen3.5) ---------- */
 typedef struct {
     int hidden, n_layers, n_heads, n_kv_heads, head_dim, inter, vocab, max_pos;
     float theta, eps;
     int tie_emb;
     int eos[4], n_eos;
+    /* ibrido Qwen3.5 (lignaggio Qwen3-Next): layer linear_attention (Gated
+     * DeltaNet) intervallati da full_attention (Gated Attention). */
+    int hybrid;
+    int rot;                    /* dimensioni ruotate dal RoPE (partial_rotary_factor*head_dim) */
+    int lin_hv, lin_hk;         /* teste value / key della parte lineare */
+    int lin_dk, lin_dv;         /* head_dim key / value della parte lineare */
+    int lin_conv;               /* kernel della conv1d causale */
+    int *ltype;                 /* [n_layers] 0=full_attention 1=linear_attention */
 } Cfg;
 
 /* peso denso: f32 oppure int8+scala per riga (QBITS=8) */
 typedef struct { float *f; int8_t *q; float *qs; int O, I; } Mat;
 
 typedef struct {
-    float *in_ln, *post_ln, *qn, *kn;      /* qn/kn: lunghezza head_dim (per testa) */
-    Mat q, k, v, o, gate, up, down;
+    int type;                              /* 0=full_attention 1=linear_attention */
+    float *in_ln, *post_ln;
+    /* full attention (anche gated: q_proj raddoppiato con il gate per testa) */
+    int gated;
+    float *qn, *kn;                        /* qn/kn: lunghezza head_dim (per testa) */
+    Mat q, k, v, o;
+    /* linear attention (Gated DeltaNet, proiezioni separate stile Qwen3.5) */
+    Mat aqkv, az, ab, aa, aout;
+    float *conv_w, *conv_b;                /* [conv_dim][K] depthwise (+bias opzionale) */
+    float *dt_bias, *A_log;                /* [lin_hv] */
+    float *dn_norm;                        /* [lin_dv] rmsnorm gated per testa */
+    float *conv_state;                     /* [conv_dim * K] persistente */
+    float *Sstate;                         /* [lin_hv * lin_dk * lin_dv] persistente */
+    /* mlp (comune) */
+    Mat gate, up, down;
 } Layer;
 
 typedef struct {
@@ -183,6 +204,35 @@ static void load_cfg(Cfg *c, const char *snap) {
     jval *th = json_get(r,"rope_theta");   c->theta = th ? (float)th->num : 1000000.f;
     jval *ep = json_get(r,"rms_norm_eps"); c->eps   = ep ? (float)ep->num : 1e-6f;
     jval *te = json_get(r,"tie_word_embeddings"); c->tie_emb = (te && te->t==J_BOOL) ? te->boolean : 0;
+    /* --- parte ibrida (Qwen3.5): presente solo se il config la dichiara --- */
+    jval *prf = json_get(r,"partial_rotary_factor");
+    c->rot = prf ? (int)(c->head_dim * prf->num + 0.5) : c->head_dim;
+    if (c->rot < 2 || c->rot > c->head_dim || (c->rot & 1)) {
+        fprintf(stderr,"config: partial_rotary_factor incoerente (rot=%d, head_dim=%d)\n", c->rot, c->head_dim); exit(1);
+    }
+    jval *lv = json_get(r,"linear_num_value_heads");
+    c->lin_hv  = lv ? (int)lv->num : 0;
+    jval *lk = json_get(r,"linear_num_key_heads");   c->lin_hk  = lk ? (int)lk->num : 0;
+    jval *ld = json_get(r,"linear_key_head_dim");    c->lin_dk  = ld ? (int)ld->num : 0;
+    jval *le = json_get(r,"linear_value_head_dim");  c->lin_dv  = le ? (int)le->num : 0;
+    jval *lc = json_get(r,"linear_conv_kernel_dim"); c->lin_conv= lc ? (int)lc->num : 4;
+    c->ltype = calloc(c->n_layers, sizeof(int));
+    jval *lt = json_get(r,"layer_types");
+    if (lt && lt->t==J_ARR) {
+        for (int i = 0; i < c->n_layers && i < lt->len; i++)
+            c->ltype[i] = (lt->kids[i]->t==J_STR && !strcmp(lt->kids[i]->str,"linear_attention")) ? 1 : 0;
+    } else if (c->lin_hv > 0) {
+        jval *fi = json_get(r,"full_attention_interval");
+        int interval = fi ? (int)fi->num : 4;
+        for (int i = 0; i < c->n_layers; i++) c->ltype[i] = ((i+1) % interval) ? 1 : 0;
+    }
+    c->hybrid = 0;
+    for (int i = 0; i < c->n_layers; i++) if (c->ltype[i]) c->hybrid = 1;
+    if (c->hybrid && (c->lin_hv<=0 || c->lin_hk<=0 || c->lin_dk<=0 || c->lin_dv<=0 ||
+                      c->lin_dk>1024 || c->lin_dv>1024 ||
+                      c->lin_hv % c->lin_hk || c->lin_conv<1 || c->lin_conv>8)) {
+        fprintf(stderr,"config: parametri linear_attention mancanti o incoerenti\n"); exit(1);
+    }
     c->n_eos = 0;
     jval *eo = json_get(r,"eos_token_id");
     if (eo) {
@@ -247,16 +297,39 @@ static void model_init(Model *m, const char *snap, int qbits) {
     char nm[256];
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
+        l->type = c->ltype[i];
         #define LDT(field, suffix, n) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm,n)
         #define LDM(field, suffix, O_, I_) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); load_mat(m,&l->field,nm,O_,I_)
         LDT(in_ln,  "input_layernorm.weight", D);
         LDT(post_ln,"post_attention_layernorm.weight", D);
-        LDT(qn, "self_attn.q_norm.weight", hd);      /* per testa, NON per hidden */
-        LDT(kn, "self_attn.k_norm.weight", hd);
-        LDM(q, "self_attn.q_proj.weight", H*hd,  D);
-        LDM(k, "self_attn.k_proj.weight", KV*hd, D);
-        LDM(v, "self_attn.v_proj.weight", KV*hd, D);
-        LDM(o, "self_attn.o_proj.weight", D, H*hd);
+        if (l->type == 0) {                          /* full attention (Qwen3 o gated Qwen3.5) */
+            LDT(qn, "self_attn.q_norm.weight", hd);  /* per testa, NON per hidden */
+            LDT(kn, "self_attn.k_norm.weight", hd);
+            /* Qwen3.5: q_proj raddoppiato = [query|gate] per testa. Rilevato dalla forma. */
+            snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_proj.weight",i);
+            int64_t qn_ = st_numel(&m->S, nm);
+            l->gated = (qn_ == (int64_t)2*H*hd*D);
+            load_mat(m, &l->q, nm, l->gated ? 2*H*hd : H*hd, D);
+            LDM(k, "self_attn.k_proj.weight", KV*hd, D);
+            LDM(v, "self_attn.v_proj.weight", KV*hd, D);
+            LDM(o, "self_attn.o_proj.weight", D, H*hd);
+        } else {                                     /* linear attention (Gated DeltaNet) */
+            int kd = c->lin_hk*c->lin_dk, vd = c->lin_hv*c->lin_dv;
+            int cd = 2*kd + vd, K = c->lin_conv;
+            LDM(aqkv, "linear_attn.in_proj_qkv.weight", cd, D);
+            LDM(az,   "linear_attn.in_proj_z.weight",   vd, D);
+            LDM(ab,   "linear_attn.in_proj_b.weight",   c->lin_hv, D);
+            LDM(aa,   "linear_attn.in_proj_a.weight",   c->lin_hv, D);
+            LDM(aout, "linear_attn.out_proj.weight",    D, vd);
+            LDT(conv_w,  "linear_attn.conv1d.weight", (int64_t)cd*K);   /* [cd,1,K] depthwise */
+            snprintf(nm,sizeof(nm),"model.layers.%d.linear_attn.conv1d.bias",i);
+            l->conv_b = st_has(&m->S, nm) ? load_t(m, nm, cd) : NULL;
+            LDT(dt_bias, "linear_attn.dt_bias", c->lin_hv);
+            LDT(A_log,   "linear_attn.A_log",   c->lin_hv);
+            LDT(dn_norm, "linear_attn.norm.weight", c->lin_dv);
+            l->conv_state = falloc((int64_t)cd*K);
+            l->Sstate = falloc((int64_t)c->lin_hv*c->lin_dk*c->lin_dv);
+        }
         LDM(gate, "mlp.gate_proj.weight", c->inter, D);
         LDM(up,   "mlp.up_proj.weight",   c->inter, D);
         LDM(down, "mlp.down_proj.weight", D, c->inter);
@@ -266,11 +339,26 @@ static void model_init(Model *m, const char *snap, int qbits) {
     m->load_s = now_s() - t0;
 }
 
-/* ---------- RoPE neox (half-split) su una testa a posizione assoluta pos ---------- */
-static void rope_head(float *x, int pos, float theta, int hd) {
-    int h = hd / 2;
+/* azzera gli stati ricorrenti dei layer lineari (inizio generazione / reset contesto) */
+static void state_reset(Model *m) {
+    Cfg *c = &m->c;
+    if (!m->L || !c->hybrid) return;
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        if (l->type != 1) continue;
+        int cd = 2*c->lin_hk*c->lin_dk + c->lin_hv*c->lin_dv;
+        memset(l->conv_state, 0, (int64_t)cd*c->lin_conv*sizeof(float));
+        memset(l->Sstate, 0, (int64_t)c->lin_hv*c->lin_dk*c->lin_dv*sizeof(float));
+    }
+}
+
+/* ---------- RoPE neox (half-split) su una testa a posizione assoluta pos.
+ * rot < hd (partial rotary, Qwen3.5): ruotate solo le prime rot dimensioni,
+ * accoppiate (j, j+rot/2), inv_freq calcolata su rot; il resto passa invariato. */
+static void rope_head(float *x, int pos, float theta, int rot) {
+    int h = rot / 2;
     for (int j = 0; j < h; j++) {
-        float inv = powf(theta, -2.0f * j / hd);
+        float inv = powf(theta, -2.0f * j / rot);
         float ang = pos * inv, cs = cosf(ang), sn = sinf(ang);
         float a = x[j], b = x[j+h];
         x[j]   = a*cs - b*sn;
@@ -278,14 +366,29 @@ static void rope_head(float *x, int pos, float theta, int hd) {
     }
 }
 
-/* attenzione GQA sui token nuovi x[S,hidden]; pos_base = posizione del primo token nuovo */
+/* attenzione GQA sui token nuovi x[S,hidden]; pos_base = posizione del primo token nuovo.
+ * Con l->gated (Qwen3.5): q_proj emette [query|gate] per testa; il contesto viene
+ * moltiplicato per sigmoid(gate) prima di o_proj. */
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     Cfg *c = &m->c;
     int H = c->n_heads, KV = c->n_kv_heads, hd = c->head_dim;
     int G = H / KV;                       /* teste query per testa kv */
     int64_t qw = (int64_t)H*hd, kw = (int64_t)KV*hd;
-    float *q = falloc(S*qw), *k = falloc(S*kw), *vv = falloc(S*kw);
-    mat_apply(q,  x, &l->q, S);
+    float *q, *gate = NULL;
+    if (l->gated) {
+        float *qg = falloc(S*2*qw);
+        mat_apply(qg, x, &l->q, S);
+        q = falloc(S*qw); gate = falloc(S*qw);
+        for (int s = 0; s < S; s++) for (int hh = 0; hh < H; hh++) {
+            memcpy(q    + s*qw + (int64_t)hh*hd, qg + s*2*qw + (int64_t)hh*2*hd,      hd*sizeof(float));
+            memcpy(gate + s*qw + (int64_t)hh*hd, qg + s*2*qw + (int64_t)hh*2*hd + hd, hd*sizeof(float));
+        }
+        free(qg);
+    } else {
+        q = falloc(S*qw);
+        mat_apply(q, x, &l->q, S);
+    }
+    float *k = falloc(S*kw), *vv = falloc(S*kw);
     mat_apply(k,  x, &l->k, S);
     mat_apply(vv, x, &l->v, S);
     /* qk-norm PER TESTA (Qwen3), poi RoPE per testa */
@@ -294,12 +397,12 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         for (int hh = 0; hh < H; hh++) {
             float *qh = q + s*qw + (int64_t)hh*hd;
             rmsnorm_row(qh, qh, l->qn, hd, c->eps);
-            rope_head(qh, pos, c->theta, hd);
+            rope_head(qh, pos, c->theta, c->rot);
         }
         for (int hh = 0; hh < KV; hh++) {
             float *kh = k + s*kw + (int64_t)hh*hd;
             rmsnorm_row(kh, kh, l->kn, hd, c->eps);
-            rope_head(kh, pos, c->theta, hd);
+            rope_head(kh, pos, c->theta, c->rot);
         }
     }
     /* scrive k,v nella kv-cache alle posizioni pos_base..pos_base+S-1 */
@@ -337,8 +440,98 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         }
         free(sc);
     }
+    if (gate) {                            /* Qwen3.5: gating per-elemento sull'output */
+        for (int64_t i = 0; i < S*qw; i++) ctx[i] *= 1.f/(1.f + expf(-gate[i]));
+        free(gate);
+    }
     mat_apply(out, ctx, &l->o, S);
     free(q); free(k); free(vv); free(ctx);
+}
+
+/* ---------- Gated DeltaNet (Qwen3.5, layer linear_attention) ----------
+ * Ricorrenza per token (fp32), stato per layer:
+ *   conv_state [cd][K]  finestra scorrevole della conv1d causale depthwise
+ *   S [hv][dk][dv]      stato ricorrente (sostituisce la KV-cache: NON cresce)
+ * Formule (transformers, torch_recurrent_gated_delta_rule + modular_qwen3_5):
+ *   q,k l2-normalizzate per testa; q *= dk^-0.5
+ *   g = -exp(A_log)*softplus(a+dt_bias); beta = sigmoid(b)
+ *   S *= exp(g); kv = k.S; delta = (v-kv)*beta; S += k(x)delta; o = q.S
+ *   out = rmsnorm(o)*w * silu(z) per testa -> out_proj */
+static inline float softplusf(float x){ return x > 20.f ? x : log1pf(expf(x)); }
+static inline float sigmoidf(float x){ return 1.f/(1.f + expf(-x)); }
+static void l2norm_head(float *x, int n){
+    double s = 0; for (int i = 0; i < n; i++) s += (double)x[i]*x[i];
+    float r = 1.f / sqrtf((float)s + 1e-6f);
+    for (int i = 0; i < n; i++) x[i] *= r;
+}
+
+/* un token: x[D] (gia' normato) -> out[D]; aggiorna gli stati del layer */
+static void deltanet_token(Model *m, Layer *l, const float *x, float *out) {
+    Cfg *c = &m->c;
+    int Hv = c->lin_hv, Hk = c->lin_hk, dk = c->lin_dk, dv = c->lin_dv, K = c->lin_conv;
+    int kd = Hk*dk, vd = Hv*dv, cd = 2*kd + vd, R = Hv/Hk;
+    float *qkv = falloc(cd), *z = falloc(vd), *b = falloc(Hv), *a = falloc(Hv);
+    mat_apply(qkv, x, &l->aqkv, 1);
+    mat_apply(z,   x, &l->az,   1);
+    mat_apply(b,   x, &l->ab,   1);
+    mat_apply(a,   x, &l->aa,   1);
+    /* conv1d causale depthwise sul solo qkv (z passa fuori), poi silu */
+    #pragma omp parallel for schedule(static)
+    for (int ch = 0; ch < cd; ch++) {
+        float *cs = l->conv_state + (int64_t)ch*K;
+        memmove(cs, cs+1, (K-1)*sizeof(float));
+        cs[K-1] = qkv[ch];
+        const float *w = l->conv_w + (int64_t)ch*K;
+        float v = 0; for (int t = 0; t < K; t++) v += cs[t]*w[t];
+        if (l->conv_b) v += l->conv_b[ch];
+        qkv[ch] = v * sigmoidf(v);          /* silu */
+    }
+    float *q = qkv, *k = qkv + kd, *v = qkv + 2*kd;
+    float qscale = 1.f / sqrtf((float)dk);
+    for (int h = 0; h < Hk; h++) {
+        l2norm_head(q + (int64_t)h*dk, dk);
+        l2norm_head(k + (int64_t)h*dk, dk);
+        for (int i = 0; i < dk; i++) q[(int64_t)h*dk + i] *= qscale;
+    }
+    float *o = falloc(vd);
+    #pragma omp parallel for schedule(static)
+    for (int hv = 0; hv < Hv; hv++) {
+        int hk = hv / R;                    /* testa k condivisa (Hv/Hk teste v per testa k) */
+        const float *qh = q + (int64_t)hk*dk, *kh = k + (int64_t)hk*dk, *vh = v + (int64_t)hv*dv;
+        float *S = l->Sstate + (int64_t)hv*dk*dv;
+        float g    = -expf(l->A_log[hv]) * softplusf(a[hv] + l->dt_bias[hv]);
+        float beta = sigmoidf(b[hv]);
+        float dec  = expf(g);
+        float kv[1024], delta[1024];        /* dv <= 1024 garantito dal CKR */
+        for (int j = 0; j < dv; j++) kv[j] = 0;
+        for (int i = 0; i < dk; i++) {
+            float *Si = S + (int64_t)i*dv;
+            float ki = kh[i];
+            for (int j = 0; j < dv; j++) { Si[j] *= dec; kv[j] += Si[j]*ki; }
+        }
+        for (int j = 0; j < dv; j++) delta[j] = (vh[j] - kv[j]) * beta;
+        float *oh = o + (int64_t)hv*dv;
+        for (int j = 0; j < dv; j++) oh[j] = 0;
+        for (int i = 0; i < dk; i++) {
+            float *Si = S + (int64_t)i*dv;
+            float ki = kh[i], qi = qh[i];
+            for (int j = 0; j < dv; j++) { Si[j] += ki*delta[j]; oh[j] += Si[j]*qi; }
+        }
+        /* rmsnorm gated per testa: norm(o)*w * silu(z) */
+        double ms = 0; for (int j = 0; j < dv; j++) ms += (double)oh[j]*oh[j];
+        float r = 1.f / sqrtf((float)(ms/dv) + c->eps);
+        const float *zh = z + (int64_t)hv*dv;
+        for (int j = 0; j < dv; j++) oh[j] = oh[j]*r*l->dn_norm[j] * (zh[j]*sigmoidf(zh[j]));
+    }
+    mat_apply(out, o, &l->aout, 1);
+    free(qkv); free(z); free(b); free(a); free(o);
+}
+
+/* deltanet su S token in sequenza (prefill = ricorrenza per token) */
+static void deltanet(Model *m, Layer *l, float *x, int S, float *out) {
+    int D = m->c.hidden;
+    for (int s = 0; s < S; s++)
+        deltanet_token(m, l, x + (int64_t)s*D, out + (int64_t)s*D);
 }
 
 /* SwiGLU denso: out[S,D] = down( silu(gate(x)) * up(x) ), per-riga per limitare i buffer */
@@ -364,7 +557,8 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
-        attention(m, l, i, nrm, S, pos_base, tmp);
+        if (l->type == 1) deltanet(m, l, nrm, S, tmp);
+        else attention(m, l, i, nrm, S, pos_base, tmp);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
         mlp(m, l, nrm, S, tmp);
@@ -384,9 +578,11 @@ static void kv_alloc(Model *m, int max_t) {
     m->max_t = max_t; m->kv_len = 0;
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++) {
+        if (c->ltype[i]) continue;         /* i layer lineari usano lo stato, non la KV */
         m->K[i] = falloc((int64_t)c->n_kv_heads * max_t * c->head_dim);
         m->V[i] = falloc((int64_t)c->n_kv_heads * max_t * c->head_dim);
     }
+    state_reset(m);
 }
 
 /* ---------- sampling (temperatura + nucleus), portato da glm.c ---------- */
@@ -535,8 +731,9 @@ int main(void) {
 
     Model m;
     model_init(&m, snap, qbits);
-    fprintf(stderr, "[qwen] %d layer, hidden %d, %d/%d teste (hd %d), inter %d, vocab %d%s | load %.1fs | RSS %.2f GB\n",
-            m.c.n_layers, m.c.hidden, m.c.n_heads, m.c.n_kv_heads, m.c.head_dim, m.c.inter, m.c.vocab,
+    int nlin = 0; for (int i = 0; i < m.c.n_layers; i++) nlin += m.c.ltype[i];
+    fprintf(stderr, "[qwen] %d layer (%d deltanet), hidden %d, %d/%d teste (hd %d, rot %d), inter %d, vocab %d%s | load %.1fs | RSS %.2f GB\n",
+            m.c.n_layers, nlin, m.c.hidden, m.c.n_heads, m.c.n_kv_heads, m.c.head_dim, m.c.rot, m.c.inter, m.c.vocab,
             m.lm_tied ? " | lm_head=embed" : "", m.load_s, rss_gb());
     if (m.c.max_pos > 0 && maxctx > m.c.max_pos) maxctx = m.c.max_pos;
 
@@ -581,7 +778,7 @@ int main(void) {
         int k = tok_encode(&T, buf, bl, hist + len, maxctx - len - 2);
         if (len + k + 8 >= maxctx) {                /* contesto pieno: reset conversazione */
             fprintf(stderr, "[qwen] contesto pieno, reset della conversazione\n");
-            len = 0; m.kv_len = 0;
+            len = 0; m.kv_len = 0; state_reset(&m);  /* lo stato ricorrente non e' troncabile */
             k = tok_encode(&T, buf, bl, hist, maxctx - 2);
         }
         int cur = ngen; if (len + k + cur + 1 > maxctx) cur = maxctx - len - k - 1;

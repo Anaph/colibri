@@ -106,7 +106,7 @@ EXE     =
 endif
 endif
 
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tok$(EXE) tests/test_qwen_units$(EXE) tests/test_qwen_tiny$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_kv_alloc$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tok$(EXE) tests/test_qwen_units$(EXE) tests/test_qwen_tiny$(EXE) tests/test_qwen_deltanet$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_kv_alloc$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
@@ -158,6 +158,9 @@ tests/test_qwen_units$(EXE): tests/test_qwen_units.c qwen.c st.h json.h tok.h to
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_qwen_tiny$(EXE): tests/test_qwen_tiny.c qwen.c st.h json.h tok.h tok_unicode.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_qwen_deltanet$(EXE): tests/test_qwen_deltanet.c tests/deltanet_fixture.h qwen.c st.h json.h tok.h tok_unicode.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_tier$(EXE): tests/test_tier.c tier.h
