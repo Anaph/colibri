@@ -6,6 +6,9 @@ int qt_rope(void);
 int qt_gqa(void);
 int qt_quant(void);
 int qt_quant_batch(void);
+int qt_int4_pack(void);
+int qt_int4_grouped(void);
+int qt_int4_matmul_ref(void);
 int qt_sampler(void);
 int qt_edges(void);
 int qt_gated_layout(void);
@@ -43,6 +46,9 @@ C_TEST(QwenRope,     MatchesDoubleRef,  qt_rope)
 C_TEST(QwenGqa,      MatchesReplicated, qt_gqa)
 C_TEST(QwenQuant,    Int8Tolerance,     qt_quant)
 C_TEST(QwenQuant,    BatchBitExact,     qt_quant_batch)
+C_TEST(QwenInt4,     PackRoundtrip,     qt_int4_pack)
+C_TEST(QwenInt4,     GroupedScales,     qt_int4_grouped)
+C_TEST(QwenInt4,     MatmulVsRef,       qt_int4_matmul_ref)
 C_TEST(QwenSampler,  Deterministic,     qt_sampler)
 C_TEST(QwenDeltanet, NumericEdges,      qt_edges)
 C_TEST(QwenGated,    QProjLayout,       qt_gated_layout)

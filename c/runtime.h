@@ -112,6 +112,7 @@ static float *load_t(Model *m, const char *name, int64_t expect) {
 /* carica [O,I]; con QBITS=8 tiene solo int8+scala e libera l'f32 */
 static void load_mat(Model *m, Mat *w, const char *name, int O, int I) {
     w->O = O; w->I = I; w->q = NULL; w->qs = NULL; w->sh = NULL; w->sname = NULL;
+    w->q4 = NULL; w->gs = 0;
     w->f = load_t(m, name, (int64_t)O*I);
     if (m->qbits == 8) {
         w->q = malloc((int64_t)O*I); w->qs = falloc(O);
@@ -163,6 +164,7 @@ static void layer_stream_in(Model *m, int li) {
         st_read_f32(&m->S, r[j].name, m->stream_buf + off, 0);  /* drop=0: la page cache aiuta */
         r[j].mat->f = m->stream_buf + off;
         r[j].mat->q = NULL; r[j].mat->qs = NULL; r[j].mat->sh = NULL;
+        r[j].mat->q4 = NULL; r[j].mat->gs = 0;
         r[j].mat->O = r[j].O; r[j].mat->I = r[j].I;
         off += (int64_t)r[j].O*r[j].I;
     }
@@ -224,7 +226,7 @@ static void mat_stream_init(Model *m, Mat *w, const char *name, int O, int I) {
                 name, (long long)have, (long long)((int64_t)O*I));
         exit(1);
     }
-    w->f = NULL; w->q = NULL; w->qs = NULL;
+    w->f = NULL; w->q = NULL; w->qs = NULL; w->q4 = NULL; w->gs = 0;
     w->O = O; w->I = I;
     w->sh = &m->S; w->sname = strdup(name);
 }

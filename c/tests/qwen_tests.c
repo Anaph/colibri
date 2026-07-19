@@ -107,6 +107,110 @@ int qt_quant_batch(void) {
     return 0;
 }
 
+/* ---- int4: pack/dequant roundtrip + ordine dei nibble ---- */
+int qt_int4_pack(void) {
+    static const int Is[] = {15, 16, 17, 32};
+    int O = 6;
+    for (size_t k = 0; k < sizeof Is/sizeof Is[0]; k++) {
+        int I = Is[k], rb = (I+1)/2;
+        float *w = falloc((int64_t)O*I); float *qs = falloc(O);
+        uint8_t *q4 = malloc((size_t)O*rb);
+        qt_rng_s = 100 + I;
+        qt_fill(w, (int64_t)O*I, 2.f);
+        pack_int4(w, q4, qs, O, I);
+        for (int o = 0; o < O; o++) {
+            float s = qs[o];
+            for (int i = 0; i < I; i++) {
+                uint8_t b = q4[(int64_t)o*rb + (i>>1)];
+                int v = (i & 1) ? (int)(b>>4)-8 : (int)(b&0xF)-8;   /* pari -> nibble basso */
+                CHECK(v >= -8 && v <= 7);
+                CHECK(fabsf(w[(int64_t)o*I+i] - s*(float)v) <= s*0.5f + 1e-6f);
+            }
+        }
+        free(w); free(qs); free(q4);
+    }
+    return 0;
+}
+
+/* ---- int4 grouped: roundtrip per gruppo + gs=I equivale al per-riga ---- */
+int qt_int4_grouped(void) {
+    int O = 5, I = 80, gs = 16, ng = (I+gs-1)/gs, rb = (I+1)/2;
+    float *w = falloc((int64_t)O*I); float *qs = falloc((int64_t)O*ng);
+    uint8_t *q4 = malloc((size_t)O*rb);
+    qt_rng_s = 321;
+    qt_fill(w, (int64_t)O*I, 2.f);
+    pack_int4_grouped(w, q4, qs, O, I, gs);
+    for (int o = 0; o < O; o++) for (int i = 0; i < I; i++) {
+        float s = qs[(int64_t)o*ng + i/gs];
+        uint8_t b = q4[(int64_t)o*rb + (i>>1)];
+        int v = (i & 1) ? (int)(b>>4)-8 : (int)(b&0xF)-8;
+        CHECK(fabsf(w[(int64_t)o*I+i] - s*(float)v) <= s*0.5f + 1e-6f);
+    }
+    /* gs che copre l'intera riga: stessi byte e stesse scale del per-riga */
+    int gs2 = 80;   /* multiplo di 16 */
+    float *qs1 = falloc(O); uint8_t *q41 = malloc((size_t)O*rb);
+    float *qs2 = falloc(O); uint8_t *q42 = malloc((size_t)O*rb);
+    pack_int4(w, q41, qs1, O, I);
+    pack_int4_grouped(w, q42, qs2, O, I, gs2);
+    CHECK(memcmp(q41, q42, (size_t)O*rb) == 0);
+    CHECK(memcmp(qs1, qs2, (size_t)O*sizeof(float)) == 0);
+    /* e i due matmul coincidono numericamente (tolleranza: ordine di accumulo) */
+    int S = 3;
+    float *x = falloc((int64_t)S*I), *y1 = falloc((int64_t)S*O), *y2 = falloc((int64_t)S*O);
+    qt_fill(x, (int64_t)S*I, 1.f);
+    matmul_i4_s(y1, x, q41, qs1, S, I, O);
+    matmul_i4_grouped_s(y2, x, q42, qs2, S, I, O, gs2);
+    for (int64_t i = 0; i < (int64_t)S*O; i++) CHECK(fabsf(y1[i]-y2[i]) <= 1e-4f*(1.f+fabsf(y1[i])));
+    free(w); free(qs); free(q4); free(qs1); free(q41); free(qs2); free(q42);
+    free(x); free(y1); free(y2);
+    return 0;
+}
+
+/* ---- matmul int4 vs riferimento double su pesi dequantizzati: il kernel
+ * calcola ESATTAMENTE dot(x, s*v) a meno dell'ordine di accumulo f32 ---- */
+int qt_int4_matmul_ref(void) {
+    int O = 24, I = 50, S = 4, gs = 16, ng = (I+gs-1)/gs, rb = (I+1)/2;
+    float *w = falloc((int64_t)O*I), *x = falloc((int64_t)S*I);
+    qt_rng_s = 654;
+    qt_fill(w, (int64_t)O*I, 1.f); qt_fill(x, (int64_t)S*I, 1.f);
+    float *qsr = falloc(O); uint8_t *q4 = malloc((size_t)O*rb);
+    float *qsg = falloc((int64_t)O*ng); uint8_t *q4g = malloc((size_t)O*rb);
+    pack_int4(w, q4, qsr, O, I);
+    pack_int4_grouped(w, q4g, qsg, O, I, gs);
+    float *yr = falloc((int64_t)S*O), *yg = falloc((int64_t)S*O);
+    matmul_i4_s(yr, x, q4, qsr, S, I, O);
+    matmul_i4_grouped_s(yg, x, q4g, qsg, S, I, O, gs);
+    for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
+        double rr = 0, rg = 0;
+        for (int i = 0; i < I; i++) {
+            uint8_t b = q4[(int64_t)o*rb + (i>>1)];
+            int v = (i & 1) ? (int)(b>>4)-8 : (int)(b&0xF)-8;
+            rr += (double)x[(int64_t)s*I+i] * (double)qsr[o] * v;
+            uint8_t bg = q4g[(int64_t)o*rb + (i>>1)];
+            int vg = (i & 1) ? (int)(bg>>4)-8 : (int)(bg&0xF)-8;
+            rg += (double)x[(int64_t)s*I+i] * (double)qsg[(int64_t)o*ng + i/gs] * vg;
+        }
+        CHECK(fabs((double)yr[(int64_t)s*O+o] - rr) <= 1e-4*(1.0+fabs(rr)));
+        CHECK(fabs((double)yg[(int64_t)s*O+o] - rg) <= 1e-4*(1.0+fabs(rg)));
+    }
+    /* batch-invarianza: S=4 in un colpo == 4 chiamate S=1, bit-esatto */
+    float *y1 = falloc((int64_t)S*O);
+    for (int s = 0; s < S; s++) matmul_i4_s(y1 + (int64_t)s*O, x + (int64_t)s*I, q4, qsr, 1, I, O);
+    CHECK(memcmp(yr, y1, (size_t)S*O*sizeof(float)) == 0);
+    float *y1g = falloc((int64_t)S*O);
+    for (int s = 0; s < S; s++) matmul_i4_grouped_s(y1g + (int64_t)s*O, x + (int64_t)s*I, q4g, qsg, 1, I, O, gs);
+    CHECK(memcmp(yg, y1g, (size_t)S*O*sizeof(float)) == 0);
+    /* mat_apply instrada sul kernel int4 giusto */
+    Mat mq; memset(&mq, 0, sizeof(mq));
+    mq.q4 = q4g; mq.qs = qsg; mq.gs = gs; mq.O = O; mq.I = I;
+    float *ya = falloc((int64_t)S*O);
+    mat_apply(ya, x, &mq, S);
+    CHECK(memcmp(ya, yg, (size_t)S*O*sizeof(float)) == 0);
+    free(w); free(x); free(qsr); free(q4); free(qsg); free(q4g);
+    free(yr); free(yg); free(y1); free(y1g); free(ya);
+    return 0;
+}
+
 /* ---- sampler: stesso seed -> stessa sequenza; greedy = argmax ---- */
 int qt_sampler(void) {
     int V = 100; float lo[100];
