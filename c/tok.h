@@ -104,6 +104,18 @@ static void tk_build_bytemap(Tok *T){
 /* ---------- caricamento tokenizer.json ---------- */
 static int cmp_sp_len(const void *a, const void *b){ return ((const Special*)b)->len - ((const Special*)a)->len; }
 
+/* tabella byte-fallback <0xXX> e inversa id2byte: identica per tokenizer.json
+ * e GGUF, il vocab e' gia' nelle hmap quando viene chiamata */
+static void tk_byte_tables(Tok *T){
+    T->id2byte=malloc(T->n_ids*sizeof(int16_t));
+    for(int i=0;i<T->n_ids;i++) T->id2byte[i]=-1;
+    for(int b=0;b<256;b++){
+        char nm[8]; int nl=snprintf(nm,sizeof(nm),"<0x%02X>",b);
+        T->byte_tok[b]=hm_get(&T->vocab,nm,nl);
+        if(T->byte_tok[b]>=0) T->id2byte[T->byte_tok[b]]=(int16_t)b;
+    }
+}
+
 static void tok_load(Tok *T, const char *path){
     memset(T,0,sizeof(*T));
     tk_build_bytemap(T);
@@ -201,14 +213,7 @@ static void tok_load(Tok *T, const char *path){
         }
         qsort(T->sp,T->nsp,sizeof(Special),cmp_sp_len);   /* match piu' lungo per primo */
     }
-    /* tabella byte-fallback <0xXX> (solo modalita' sp; -1 se il vocab non li ha) */
-    T->id2byte=malloc(T->n_ids*sizeof(int16_t));
-    for(int i=0;i<T->n_ids;i++) T->id2byte[i]=-1;
-    for(int b=0;b<256;b++){
-        char nm[8]; int nl=snprintf(nm,sizeof(nm),"<0x%02X>",b);
-        T->byte_tok[b]=hm_get(&T->vocab,nm,nl);
-        if(T->byte_tok[b]>=0) T->id2byte[T->byte_tok[b]]=(int16_t)b;
-    }
+    tk_byte_tables(T);      /* <0xXX> (solo modalita' sp; -1 se il vocab non li ha) */
     /* tutte le stringhe vive stanno nel pool: il parse JSON (~450k malloc su
      * un vocab da 150k) e il testo del file si possono liberare */
     json_free(root); free(buf);
@@ -284,13 +289,7 @@ static void tok_load_gguf(Tok *T, GgufMeta *M) {
             T->sp[si].id = id; si++;
         }
     qsort(T->sp, T->nsp, sizeof(Special), cmp_sp_len);
-    T->id2byte = malloc(T->n_ids * sizeof(int16_t));
-    for (int i = 0; i < T->n_ids; i++) T->id2byte[i] = -1;
-    for (int b = 0; b < 256; b++) {
-        char nm[8]; int nl = snprintf(nm, sizeof(nm), "<0x%02X>", b);
-        T->byte_tok[b] = hm_get(&T->vocab, nm, nl);
-        if (T->byte_tok[b] >= 0) T->id2byte[T->byte_tok[b]] = (int16_t)b;
-    }
+    tk_byte_tables(T);
     fprintf(stderr, "[tok] GGUF: %d token, %lld merges, %d added\n",
             T->n_ids, (long long)nmerg, T->nsp);
 }
