@@ -175,10 +175,12 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int n){
 static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     int32_t sum=0; int i=0;
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
-    /* 32 bytes = 64 nibbles -> int8 in [-8,7], one vpdpbusd per 64 values.
-     * 256-bit unpack leaves values in per-128-lane order [0-15][32-47]/[16-31][48-63];
-     * dot pairing is order-invariant, so permute x's 128-bit blocks to match
-     * instead of re-ordering w (one vpermq per iter, off the critical unpack path). */
+    /* 32 byte = 64 nibble -> int8 in [-8,7], un vpdpbusd ogni 64 valori.
+     * L'unpack a 256 bit lascia i valori in ordine per-lane-128
+     * [0-15][32-47]/[16-31][48-63]; l'accoppiamento del dot e' invariante
+     * all'ordine, quindi si permutano i blocchi da 128 bit di x (un vpermq
+     * per iterazione, fuori dal percorso critico dell'unpack) invece di
+     * riordinare w. */
     const __m256i m4v=_mm256_set1_epi8(0x0F);
     const __m512i b8v=_mm512_set1_epi8(8);
     const __m512i xidx=_mm512_setr_epi64(0,1,4,5,2,3,6,7);
