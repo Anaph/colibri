@@ -9,6 +9,8 @@
 
 #include "../json.h"
 #include "../st.h"
+#include "../gguf.h"
+#include "tiny_gguf.h"
 #include "../tok.h"
 #include "../tier.h"
 #include "../grammar.h"
@@ -70,6 +72,148 @@ int ht_st(void) {
     CHECK(isinf(f16_to_f32(0x7c00)));
     CHECK(st_hash("tensor.weight") == st_hash("tensor.weight"));
     CHECK(st_hash("tensor.weight") != st_hash("tensor.bias"));
+    return 0;
+}
+
+/* ---------------- gguf.h ---------------- */
+static const char *ht_gguf_tmp(const char *name, char *path, int cap) {
+    const char *tmp = getenv("TMPDIR"); if (!tmp) tmp = "/tmp";
+    snprintf(path, cap, "%s/ht_%s.gguf", tmp, name);
+    return path;
+}
+
+/* header v3: KV tipati (str/u32/f32/array), traduzione nomi, lettura f32 */
+int ht_gguf_header(void) {
+    char path[512]; ht_gguf_tmp("hdr", path, sizeof(path));
+    tg_reset();
+    tg_kv_str("general.architecture", "qwen3");
+    tg_kv_u32("qwen3.embedding_length", 16);
+    tg_kv_f32("qwen3.rope.freq_base", 1000000.0f);
+    static const char *toks[3] = { "a", "bb", "ccc" };
+    tg_kv_arr_str("tokenizer.ggml.tokens", toks, 3);
+    static const int32_t tt[3] = { 1, 1, 3 };
+    tg_kv_arr_i32("tokenizer.ggml.token_type", tt, 3);
+    float emb[8*16], qw[16*16];
+    for (int i = 0; i < 8*16; i++) emb[i] = (float)i * 0.25f;
+    for (int i = 0; i < 16*16; i++) qw[i] = (float)(i % 7) - 3.f;
+    tg_tensor_f32("token_embd.weight", 8, 16, emb);
+    tg_tensor_f32("blk.0.attn_q.weight", 16, 16, qw);
+    tg_write(path);
+    shards S; GgufMeta M;
+    gguf_index(&S, &M, path);
+    CHECK(!strcmp(M.arch, "qwen3"));
+    CHECK(gguf_int(&M, "qwen3.embedding_length", -1) == 16);
+    CHECK(fabs(gguf_float(&M, "qwen3.rope.freq_base", 0) - 1000000.0) < 1);
+    CHECK(gguf_int(&M, "assente", -7) == -7);
+    /* traduzione nomi llama.cpp -> HF */
+    CHECK(st_numel(&S, "model.embed_tokens.weight") == 8*16);
+    CHECK(st_numel(&S, "model.layers.0.self_attn.q_proj.weight") == 16*16);
+    CHECK(!st_has(&S, "token_embd.weight"));
+    /* dati identici byte a byte */
+    float r[16*16];
+    st_read_f32(&S, "model.embed_tokens.weight", r, 0);
+    CHECK(memcmp(r, emb, sizeof(emb)) == 0);
+    st_read_slice_f32(&S, "model.layers.0.self_attn.q_proj.weight", 2*16, 16, r, 0);
+    CHECK(memcmp(r, qw + 2*16, 16*sizeof(float)) == 0);
+    /* iterazione array: stringhe e interi */
+    garr a; int64_t l;
+    CHECK(gguf_arr(&M, "tokenizer.ggml.tokens", &a));
+    const char *s0 = garr_next_str(&a, &l); CHECK(l == 1 && s0[0] == 'a');
+    garr_next_str(&a, &l); CHECK(l == 2);
+    garr_next_str(&a, &l); CHECK(l == 3);
+    CHECK(garr_next_str(&a, &l) == NULL);
+    CHECK(gguf_arr(&M, "tokenizer.ggml.token_type", &a));
+    CHECK(garr_next_int(&a) == 1 && garr_next_int(&a) == 1 && garr_next_int(&a) == 3);
+    remove(path);
+    return 0;
+}
+
+/* Q8_0/Q4_0: dequant esatto su blocchi costruiti a mano (scale f16 note) */
+int ht_gguf_q40_q80(void) {
+    /* Q8_0: d=2.0 (0x4000), q=i-16 -> out=2*(i-16) */
+    uint8_t b8[34]; uint16_t d = 0x4000; memcpy(b8, &d, 2);
+    for (int i = 0; i < 32; i++) ((int8_t*)(b8+2))[i] = (int8_t)(i - 16);
+    float out[32];
+    gguf_dq_q8_0(b8, 1, out);
+    for (int i = 0; i < 32; i++) CHECK(out[i] == 2.f*(float)(i-16));
+    /* Q4_0: d=0.5 (0x3800); byte i = elem i (basso) ed elem i+16 (alto) */
+    uint8_t b4[18]; d = 0x3800; memcpy(b4, &d, 2);
+    for (int i = 0; i < 16; i++) b4[2+i] = (uint8_t)((i & 0xF) | (((15-i) & 0xF) << 4));
+    gguf_dq_q4_0(b4, 1, out);
+    for (int i = 0; i < 16; i++) {
+        CHECK(out[i]      == 0.5f*(float)(i - 8));
+        CHECK(out[i + 16] == 0.5f*(float)((15-i) - 8));
+    }
+    /* repack -> int4 grouped: dequant del NOSTRO layout bit-identico */
+    uint8_t q4[16]; float qs[1];
+    gguf_repack_q4_0(b4, q4, qs, 1, 32);
+    CHECK(qs[0] == 0.5f);
+    for (int i = 0; i < 32; i++) {
+        uint8_t byte = q4[i >> 1];
+        int v = (i & 1) ? (int)(byte >> 4) - 8 : (int)(byte & 0xF) - 8;
+        CHECK(qs[0]*(float)v == out[i]);
+    }
+    return 0;
+}
+
+/* K-quants: superblocchi costruiti a mano vs riferimento per-elemento */
+int ht_gguf_kquants(void) {
+    float out[256];
+    /* Q4_K: d=1.0, dmin=0.5, scales[12]=j+1, qs[i]=pattern */
+    uint8_t b[210]; memset(b, 0, sizeof(b));
+    uint16_t one = 0x3C00, half = 0x3800;
+    memcpy(b, &one, 2); memcpy(b+2, &half, 2);
+    for (int j = 0; j < 12; j++) b[4+j] = (uint8_t)(j + 1);
+    for (int i = 0; i < 128; i++) b[16+i] = (uint8_t)((i*7) & 0xFF);
+    gguf_dq_q4k(b, 1, out);
+    { const uint8_t *sc = b+4, *q = b+16; int is = 0; float *y = out;
+      for (int j = 0; j < 256; j += 64) {
+          uint8_t s1, m1, s2, m2;
+          gg_k4_scale(is+0, sc, &s1, &m1); gg_k4_scale(is+1, sc, &s2, &m2);
+          for (int l = 0; l < 32; l++) CHECK(*y++ == 1.f*s1*(float)(q[l] & 0xF) - 0.5f*m1);
+          for (int l = 0; l < 32; l++) CHECK(*y++ == 1.f*s2*(float)(q[l] >>  4) - 0.5f*m2);
+          q += 32; is += 2;
+      } }
+    /* Q5_K: come Q4_K ma con il bit alto da qh */
+    memset(b, 0, sizeof(b));
+    memcpy(b, &one, 2); memcpy(b+2, &half, 2);
+    for (int j = 0; j < 12; j++) b[4+j] = (uint8_t)(13 - j);
+    for (int i = 0; i < 32; i++) b[16+i] = (uint8_t)(i*11);
+    for (int i = 0; i < 128; i++) b[48+i] = (uint8_t)(255 - i);
+    gguf_dq_q5k(b, 1, out);
+    { const uint8_t *sc = b+4, *qh = b+16, *ql = b+48; int is = 0; float *y = out;
+      uint8_t u1 = 1, u2 = 2;
+      for (int j = 0; j < 256; j += 64) {
+          uint8_t s1, m1, s2, m2;
+          gg_k4_scale(is+0, sc, &s1, &m1); gg_k4_scale(is+1, sc, &s2, &m2);
+          for (int l = 0; l < 32; l++) CHECK(*y++ == 1.f*s1*(float)((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - 0.5f*m1);
+          for (int l = 0; l < 32; l++) CHECK(*y++ == 1.f*s2*(float)((ql[l] >>  4) + ((qh[l] & u2) ? 16 : 0)) - 0.5f*m2);
+          ql += 32; is += 2; u1 <<= 2; u2 <<= 2;
+      } }
+    /* Q6_K: ql/qh/scales int8/d */
+    memset(b, 0, sizeof(b));
+    for (int i = 0; i < 128; i++) b[i] = (uint8_t)(i*3);
+    for (int i = 0; i < 64; i++) b[128+i] = (uint8_t)(i*5);
+    for (int i = 0; i < 16; i++) ((int8_t*)(b+192))[i] = (int8_t)(i - 8);
+    memcpy(b+208, &one, 2);
+    gguf_dq_q6k(b, 1, out);
+    { const uint8_t *ql = b, *qh = b+128; const int8_t *sc = (const int8_t*)(b+192);
+      float *y = out;
+      for (int n = 0; n < 256; n += 128) {
+          for (int l = 0; l < 32; l++) {
+              int is = l/16;
+              int q1 = (int)((ql[l]    & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+              int q2 = (int)((ql[l+32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+              int q3 = (int)((ql[l]    >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+              int q4v = (int)((ql[l+32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+              CHECK(y[l]      == 1.f*sc[is]   * (float)q1);
+              CHECK(y[l + 32] == 1.f*sc[is+2] * (float)q2);
+              CHECK(y[l + 64] == 1.f*sc[is+4] * (float)q3);
+              CHECK(y[l + 96] == 1.f*sc[is+6] * (float)q4v);
+          }
+          y += 128; ql += 64; qh += 32; sc += 8;
+      } }
+    g_st_dequant_fn = NULL;          /* non inquinare gli altri test st */
     return 0;
 }
 

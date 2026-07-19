@@ -61,6 +61,23 @@ static int st_dtype_code(const char *s) {
     fprintf(stderr, "unsupported dtype: %s\n", s); exit(1);
 }
 
+/* dtype >= ST_DTYPE_QBLOCK: formati GGUF a blocchi. La geometria sta qui;
+ * la dequantizzazione la installa gguf.h via g_st_dequant_fn (stesso pattern
+ * di g_mat_stream_fn: st.h resta ignaro del formato GGUF). */
+#define ST_DTYPE_QBLOCK 4
+enum { ST_Q8_0 = 4, ST_Q4_0 = 5, ST_Q4_K = 6, ST_Q5_K = 7, ST_Q6_K = 8 };
+static int st_qblock(int dtype, int *belems, int *bbytes) {
+    switch (dtype) {
+        case ST_Q8_0: *belems = 32;  *bbytes = 34;  return 1;
+        case ST_Q4_0: *belems = 32;  *bbytes = 18;  return 1;
+        case ST_Q4_K: *belems = 256; *bbytes = 144; return 1;
+        case ST_Q5_K: *belems = 256; *bbytes = 176; return 1;
+        case ST_Q6_K: *belems = 256; *bbytes = 210; return 1;
+    }
+    return 0;
+}
+static void (*g_st_dequant_fn)(int dtype, const void *raw, int64_t numel, float *out) = NULL;
+
 static inline float bf16_to_f32(uint16_t h) {
     uint32_t u = (uint32_t)h << 16; float f; memcpy(&f, &u, 4); return f;
 }
@@ -233,6 +250,13 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     void *raw = malloc(t->nbytes);
     if (!raw) { fprintf(stderr, "malloc %lld bytes for tensor %s failed\n", (long long)t->nbytes, name); exit(1); }
     if (pread(t->fd, raw, t->nbytes, t->off) != t->nbytes) { perror("pread data"); exit(1); }
+    if (t->dtype >= ST_DTYPE_QBLOCK) {
+        if (!g_st_dequant_fn) { fprintf(stderr, "tensor %s: dtype quantizzato senza dequant hook\n", name); exit(1); }
+        g_st_dequant_fn(t->dtype, raw, t->numel, out);
+        free(raw);
+        if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
+        return t->numel;
+    }
     if (t->dtype == 2) {
         memcpy(out, raw, t->nbytes);
     } else if (t->dtype == 0) {
@@ -251,6 +275,9 @@ static int64_t st_numel(shards *S, const char *name) {
 static int64_t st_nbytes(shards *S, const char *name) {
     st_tensor *t = st_find(S, name); return t ? t->nbytes : -1;
 }
+static int st_dtype(shards *S, const char *name) {
+    st_tensor *t = st_find(S, name); return t ? t->dtype : -1;
+}
 
 /* legge i byte GREZZI di un tensore (nessuna conversione di dtype): per i pesi gia'
  * quantizzati int4/int8 del nostro container (dtype U8). drop=1 -> fadvise DONTNEED. */
@@ -268,6 +295,25 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
     if (t->dtype == 3) { fprintf(stderr, "tensor %s: slice read su dtype U8 non supportata\n", name); exit(1); }
+    if (t->dtype >= ST_DTYPE_QBLOCK) {
+        /* formati a blocchi: la fetta deve essere allineata ai blocchi. I
+         * chiamanti tagliano per righe e ggml impone ne0 %% blocco == 0,
+         * quindi i confini di riga sono sempre allineati. */
+        int be, bb;
+        if (!st_qblock(t->dtype, &be, &bb) || !g_st_dequant_fn) {
+            fprintf(stderr, "tensor %s: dtype quantizzato senza geometria/hook\n", name); exit(1); }
+        if (elem_off % be || n_elems % be) {
+            fprintf(stderr, "tensor %s: slice non allineata al blocco (%lld+%lld %% %d)\n",
+                    name, (long long)elem_off, (long long)n_elems, be); exit(1); }
+        int64_t boff = t->off + elem_off/be*bb, nb = n_elems/be*bb;
+        void *raw = malloc(nb);
+        if (!raw) { fprintf(stderr, "OOM slice %s\n", name); exit(1); }
+        if (pread(t->fd, raw, nb, boff) != nb) { perror("pread qslice"); exit(1); }
+        g_st_dequant_fn(t->dtype, raw, n_elems, out);
+        free(raw);
+        if (drop) posix_fadvise(t->fd, boff, nb, POSIX_FADV_DONTNEED);
+        return;
+    }
     int esz = (t->dtype == 2) ? 4 : 2;
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
     void *raw = malloc(nb);
