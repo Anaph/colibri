@@ -39,6 +39,33 @@ typedef struct Mat { float *f; int8_t *q; float *qs; int O, I;
                      const void *sh; const char *sname; } Mat;
 static void (*g_mat_stream_fn)(float *y, const float *x, const struct Mat *w, int S) = NULL;
 
+/* ---------- campi comuni della struct Model dei motori densi ----------
+ * runtime.h e i pezzi condivisi (kv_arrays_alloc, embed_row, streaming)
+ * toccano questi campi PER CONVENZIONE: una sola definizione elimina il
+ * rischio di deriva fra i due motori. I tipi (Cfg, Layer, shards) si
+ * risolvono al punto di espansione; le parti specifiche del motore
+ * (lm_lora, PLE...) restano scritte esplicitamente dopo la macro.
+ *   embed/embed_q: tabella f32 oppure int8 per riga (QBITS!=0);
+ *   K/V oppure K8/V8+Ks/Vs (KV_BITS=8, scala per (testa, pos) [hh*max_t+t]);
+ *   att_sc: scratch score attention [n_thread][max_t];
+ *   streaming a budget: primi n_resident layer residenti, il resto riletto
+ *   a ogni step in stream_buf (f32) o stream_q/stream_qs (QBITS=8). */
+#define MODEL_COMMON_FIELDS \
+    Cfg c;                                          \
+    shards S;                                       \
+    int qbits;                                      \
+    float *embed, *final_norm;                      \
+    int8_t *embed_q; float *embed_qs;               \
+    Mat lm_head; int lm_tied;                       \
+    Layer *L;                                       \
+    float **K, **V; int kv_len, max_t;              \
+    int8_t **K8, **V8; float **Ks, **Vs;            \
+    float *att_sc;                                  \
+    int n_resident;                                 \
+    float *stream_buf;                              \
+    int8_t *stream_q; float *stream_qs;             \
+    double load_s
+
 /* azzera TUTTI i discriminatori di storage di una Mat: prima era open-coded
  * in sei posti con sottoinsiemi DIVERSI dei campi (bug-surface a ogni campo
  * nuovo). O/I restano al chiamante. */

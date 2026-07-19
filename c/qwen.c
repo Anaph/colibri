@@ -81,26 +81,8 @@ typedef struct {
 } Layer;
 
 typedef struct {
-    Cfg c;
-    shards S;
-    int qbits;
-    float *embed, *final_norm;
-    int8_t *embed_q; float *embed_qs;      /* QBITS=8: embed int8 per riga (embed=NULL) */
-    Mat lm_head; int lm_tied;
+    MODEL_COMMON_FIELDS;                   /* contratto con runtime.h (nn.h) */
     Lora lm_lora;                          /* adattatore LoRA sull'lm_head (r=0 = spento) */
-    Layer *L;
-    /* kv-cache per-layer: K,V come [n_kv_heads * max_t * head_dim].
-     * Con KV_BITS=8 al posto di K/V vivono K8/V8 (int8) + Ks/Vs (scala per
-     * (testa_kv, posizione), indice [hh*max_t + t]). */
-    float **K, **V; int kv_len, max_t;
-    int8_t **K8, **V8; float **Ks, **Vs;
-    float *att_sc;              /* scratch punteggi attention: [n_thread][max_t] */
-    /* streaming a budget (MEM_GB/MEM_FRAC): i primi n_resident layer stanno in
-     * RAM, gli altri vengono riletti dal disco a ogni step in stream_buf */
-    int n_resident;
-    float *stream_buf;                     /* scratch f32 (QBITS=0/4) */
-    int8_t *stream_q; float *stream_qs;    /* scratch int8+scale (QBITS=8) */
-    double load_s;
 } Model;
 
 /* --- TTA sperimentale: adattamento lento a runtime (docs/online-learning.md).
