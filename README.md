@@ -86,6 +86,9 @@ Common environment variables (qwen engine):
 | `MEM_FRAC` | — | same budget as a fraction (0..1) of total physical RAM; `MEM_GB` wins |
 | `MICRO` | 0 | 1 → micro-RSS mode (qwen only): **no** weights resident, minimum possible RAM; see below |
 | `MICRO_DROP` | 1 | 0 → let streamed weight pages live in the OS page cache (faster, more memory charged to the process's cgroup) |
+| `KV_BITS` | 0 | 8 → int8 KV cache with one scale per (kv-head, position): 4× less KV RAM/traffic (1.2 GB → 300 MB at 4B/4k ctx). Queries stay f32, so the quantization error is one-sided |
+| `PREFILL_CHUNK` | 0 | feed the prompt to the model in blocks of ≤N tokens: caps prefill activation peaks (≈1.6 GB at S=4096 on 4B → tens of MB at N=256), **bit-identical** output. Off by default: with `MEM_GB` each block re-reads the streamed layers from disk |
+| `GGUF` | — | single-file GGUF model instead of `SNAP` (qwen): weights, config and tokenizer all come from the file; see below |
 | `REF` | — | ref.json with prompt_ids/full_ids for greedy validation |
 | `TOKENS` | 0 | 1 → dump generated token ids to stderr |
 | `TTA` | off | **experimental** test-time adaptation: `cache` (neural cache), `bias` (online logit bias) or `lora` (online low-rank lm_head adapter); see [docs/online-learning.md](docs/online-learning.md) |
@@ -113,10 +116,31 @@ mechanism.
 as many layers resident as fit the budget (embeddings, norms and recurrent
 state always stay resident) and re-reads the remaining layers from the
 safetensors on every step, prefetching the next layer while the current one
-computes. Streamed layers always run f32 (`QBITS` applies to resident layers
-only); token output is identical at any budget. Unset → everything resident.
-The classic path never goes below embeddings-f32 + one layer of scratch; if
-your budget is under that floor the engine tells you to use `MICRO=1`.
+computes. With `QBITS=8` the streamed layers are quantized on read and run
+the same int8 kernel as resident ones (4× smaller scratch and disk traffic,
+token output identical to fully-resident int8); at `QBITS=0/4` they run f32.
+Token output is identical at any budget. Unset → everything resident. The
+classic path never goes below embeddings + one layer of scratch; if your
+budget is under that floor the engine tells you to use `MICRO=1`.
+
+## GGUF
+
+The qwen engine runs GGUF files directly — one file, nothing else needed:
+
+```bash
+GGUF=Qwen3-0.6B-Q4_K_M.gguf PROMPT="hi" ./qwen
+```
+
+Weights are indexed into the same loader the safetensors path uses (names
+translated from the llama.cpp scheme), the config is synthesized from the
+`<arch>.*` metadata, and the tokenizer comes from `tokenizer.ggml.*`
+(byte-level BPE only — the Qwen family). Supported tensor types: F32, F16,
+BF16, Q8_0, Q4_0 and the K-quants Q4_K/Q5_K/Q6_K (dequantized on load, then
+requantized per `QBITS`). Special case: Q4_0 with `QBITS=4` is repacked
+**losslessly** into the engine's group-wise int4 (same nibble encoding, same
+32-element scale blocks) — you run exactly the bits that are in the file.
+`REF=`, `MEM_GB`, `MICRO=1`, `KV_BITS` and LoRA adapters all work as with a
+snapshot directory.
 
 `MICRO=1` (qwen only) is the mode for **hard** memory limits (cgroup,
 embedded): nothing of the model stays resident. Embedding rows are gathered

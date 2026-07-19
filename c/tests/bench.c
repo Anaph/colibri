@@ -78,6 +78,40 @@ int main(int argc, char **argv) {
         }
         free(W); free(q); free(qs);
     }
+    /* (b3) matmul_i4_grouped int4 (QBITS=4, gs=32): meta' dei byte di int8 */
+    {
+        int O = 4096, I = 4096, gs = 32, ng = I/gs, iters = 50;
+        float *W = falloc((int64_t)O*I), *x = falloc(I), *y = falloc(O);
+        uint8_t *q4 = malloc((int64_t)O*(I/2)); float *qs = falloc((int64_t)O*ng);
+        bn_fill(W, (int64_t)O*I); bn_fill(x, I);
+        pack_int4_grouped(W, q4, qs, O, I, gs);
+        matmul_i4_grouped_s(y, x, q4, qs, 1, I, O, gs); /* warm-up */
+        double t0 = now_s();
+        for (int it = 0; it < iters; it++) matmul_i4_grouped_s(y, x, q4, qs, 1, I, O, gs);
+        double t = now_s() - t0;
+        double fl = 2.0*O*I*iters;
+        fprintf(stderr, "%-28s %10.4f %10.2f %10.2f\n", "matmul_i4 gs32 4096x4096",
+                t, fl/t/1e9, (double)O*(I/2)*iters/t/1e9);
+        free(W); free(x); free(y); free(q4); free(qs);
+    }
+    /* (c2) dot_f32i8 forma KV int8: 4096 dot di lunghezza 128 */
+    {
+        int T = 4096, hd = 128, iters = 1000;
+        float *qv = falloc(hd);
+        int8_t *K8 = malloc((int64_t)T*hd);
+        bn_fill(qv, hd);
+        for (int64_t i = 0; i < (int64_t)T*hd; i++) K8[i] = (int8_t)(i*37);
+        volatile float sink = 0;
+        double t0 = now_s();
+        for (int it = 0; it < iters; it++)
+            for (int tt = 0; tt < T; tt++) sink += dot_f32i8(qv, K8 + (int64_t)tt*hd, hd);
+        double t = now_s() - t0;
+        double fl = 2.0*(double)T*hd*iters;
+        fprintf(stderr, "%-28s %10.4f %10.2f %10.2f\n", "dot_f32i8 kv 4096x128",
+                t, fl/t/1e9, (double)T*hd*1*iters/t/1e9);
+        (void)sink;
+        free(qv); free(K8);
+    }
     /* (c) dot_f32 forma attention: 4096 dot di lunghezza 128 */
     {
         int T = 4096, hd = 128, iters = 1000;

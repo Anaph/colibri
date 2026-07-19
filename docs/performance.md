@@ -20,7 +20,7 @@ At Qwen3-4B scale (~4B params):
 |---|---|---|---|---|
 | f32 | ~16 GB | 1.5 tok/s | 3.7 | 15 |
 | int8 (`QBITS=8`) | ~4 GB | 6 | 15 | 60 |
-| int4 (deferred) | ~2 GB | 12 | 30 | 120 |
+| int4 (`QBITS=4`) | ~2 GB | 12 | 30 | 120 |
 
 Everything else is noise at decode: KV-cache reads are ~288 KB/token at 4k
 context (0.01% of weight traffic), activations and the DeltaNet S-state are
@@ -85,35 +85,52 @@ Container: 4 shared cores, AVX512-VNNI, portable-build kernels for the table
    resident f32 path. Decode cost becomes *disk* bandwidth ÷ model bytes —
    the same wall as §1 with the disk in place of RAM. For hard cgroup /
    embedded limits where tok/s is secondary.
+8. **int4 weights (`QBITS=4`)** — the "single largest available win" from
+   the deferred list, now landed: glm's bit-exact-validated int4 kernels
+   (packing, exact f32×int4 matmul, group-wise scales `QGROUP`, default 32)
+   lifted into the shared core. Layer weights halve again vs int8 (~2 GB at
+   4B → ~2× decode ceiling per §1); embeddings and the lm_head deliberately
+   stay int8 (the head is the most quantization-sensitive GEMV). The int4
+   IDOT kernel (`dot_i4i8`) is ported and tested but not yet wired — the
+   exact kernel already wins 4× on weight traffic.
+9. **int8 KV cache (`KV_BITS=8`)** — promoted from the deferred list since
+   at 4k context the f32 KV (1.2 GB at 4B) rivals quantized weights.
+   Per-(head, position) scales, quantize-on-write, one-sided error (queries
+   stay f32 via `dot_f32i8`). Works with gemma's sliding windows, shared-KV
+   aliasing and k_eq_v.
+10. **Chunked prefill (`PREFILL_CHUNK`)** — bounds the S-proportional
+   activation peak (mlp scratch alone is 2·S·inter floats) and the permanent
+   `matmul_q_s` scratch growth to a constant, bit-identically; opt-in
+   because with `MEM_GB` every chunk re-reads the streamed layers.
+11. **GGUF reading (`GGUF=`)** — single-file models; Q4_0 repacks
+   losslessly onto the int4 kernels, K-quants dequantize on load. Not a
+   speed feature per se, but it removes the f32 load transient and lets the
+   engine start from pre-quantized files.
 
 ## 3. Deferred optimizations, cost/benefit at 4B
 
-Ordered by expected value:
+Ordered by expected value (items 1 and 6 of the original list have since
+landed as §2.8/§2.9 above):
 
-1. **int4 weights** — halves decode bytes again (≈2 GB/token → ~2× decode
-   tok/s on the same RAM). The `dot_i4i8` kernel family already exists in
-   glm.c (AVX512-VNNI/AVX2/NEON, validated bit-exact there); needed: lift into
-   simd.h, an int4 packing path in `load_mat`/`quantize_rows`, `QBITS=4`.
-   The single largest available win.
-2. **Speculative decoding** — the structural escape from the wall: draft
+1. **Speculative decoding** — the structural escape from the wall: draft
    cheaply, verify K tokens in one batched forward (weight bytes amortize
    over K like prefill). Qwen3.5's cheap linear layers or an n-gram draft
    both fit; glm.c has a working MTP/n-gram speculation loop to model on.
-3. **Weight interleave for VNNI** — reorder int8 rows so the dot kernel loads
+2. **Weight interleave for VNNI** — reorder int8 rows so the dot kernel loads
    are perfectly sequential across the unrolled accumulators (llama.cpp /
    [Neural Speed](https://arxiv.org/abs/2411.19542)-style fused layouts
    reach >90% of bandwidth on INT4 GEMV). Moderate win over the current
    row-major int8 (already sequential per row); real gain appears with int4.
-4. **NUMA placement** — first-touch or interleaved weight allocation +
+3. **NUMA placement** — first-touch or interleaved weight allocation +
    binding the team per socket; only matters on multi-socket / chiplet-split
    machines ([ArcLight](https://arxiv.org/abs/2603.07770) reports the
    cross-NUMA bottleneck dominating many-core CPU inference).
-5. **Hugepages** — `MADV_HUGEPAGE` on the big weight buffers cuts TLB misses
+4. **Hugepages** — `MADV_HUGEPAGE` on the big weight buffers cuts TLB misses
    during streaming; single-digit % on Linux, ~10 lines.
-6. **KV-cache quantization / paging** — irrelevant at 4k context (288
-   KB/token) but becomes real at 100k+; the hybrid architectures (DeltaNet,
-   sliding windows) already bound this structurally.
-7. **Async prefetch of streamed layers** — the MEM_GB path already issues
+5. **KV-cache paging** — int8 KV landed (§2.9); page-level eviction only
+   matters at 100k+ context, and the hybrid architectures (DeltaNet, sliding
+   windows) already bound this structurally.
+6. **Async prefetch of streamed layers** — the MEM_GB path already issues
    `WILLNEED` for layer i+1; a dedicated I/O thread
    ([async KV prefetching](https://arxiv.org/abs/2504.06319) analog) could
    overlap more aggressively.
