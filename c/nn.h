@@ -310,6 +310,47 @@ static void mat_apply(float *y, const float *x, const Mat *w, int S) {
     else matmul(y, x, w->f, S, w->I, w->O);
 }
 
+/* ---------- primitive di riga dell'attention (condivise qwen/gemma) ----------
+ * Un solo corpo per gli score e per l'accumulo dei value, nelle due
+ * rappresentazioni della KV (f32 e int8+scala per riga). Il ramo i8/f32 resta
+ * a granularita' dell'intera riga: NESSUN branch nei cicli interni. sc e'
+ * indicizzato relativo alla finestra (t-t0); qwen passa t0=0, gemma il suo t0
+ * di sliding window; kvbase = kvh * max_t (le scale si indicizzano sul t
+ * ASSOLUTO). Corpi identici alle versioni per-motore: stesso ordine FP. */
+static inline void att_scores_f32(float *sc, const float *qv, const float *K,
+                                  int64_t kvbase, int t0, int qpos, int hd, float scale) {
+    for (int t = t0; t <= qpos; t++)
+        sc[t-t0] = dot_f32(qv, K + (kvbase + t)*hd, hd) * scale;
+}
+/* q resta f32: errore di quantizzazione UNILATERALE, solo sul K int8 */
+static inline void att_scores_i8(float *sc, const float *qv, const int8_t *K8,
+                                 const float *Ks, int64_t kvbase, int t0, int qpos,
+                                 int hd, float scale) {
+    for (int t = t0; t <= qpos; t++) {
+        int64_t slot = kvbase + t;
+        sc[t-t0] = Ks[slot] * dot_f32i8(qv, K8 + slot*hd, hd) * scale;
+    }
+}
+static inline void att_accum_f32(float *cx, const float *sc, const float *V,
+                                 int64_t kvbase, int t0, int qpos, int hd) {
+    for (int dd = 0; dd < hd; dd++) cx[dd] = 0;
+    for (int t = t0; t <= qpos; t++) {
+        const float *vr = V + (kvbase + t)*hd;
+        float a = sc[t-t0];
+        for (int dd = 0; dd < hd; dd++) cx[dd] += a * vr[dd];
+    }
+}
+static inline void att_accum_i8(float *cx, const float *sc, const int8_t *V8,
+                                const float *Vs, int64_t kvbase, int t0, int qpos, int hd) {
+    for (int dd = 0; dd < hd; dd++) cx[dd] = 0;
+    for (int t = t0; t <= qpos; t++) {
+        int64_t slot = kvbase + t;
+        const int8_t *vr = V8 + slot*hd;
+        float a = sc[t-t0] * Vs[slot];         /* dequant fuso nell'accumulo */
+        for (int dd = 0; dd < hd; dd++) cx[dd] += a * (float)vr[dd];
+    }
+}
+
 static void rmsnorm_row(float *out, const float *x, const float *w, int D, float eps) {
     double ms = 0; for (int i = 0; i < D; i++) ms += (double)x[i]*x[i];
     float r = 1.f / sqrtf((float)(ms / D) + eps);

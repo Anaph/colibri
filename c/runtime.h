@@ -407,6 +407,61 @@ static void model_init(Model *m, const char *snap, int qbits) {
     model_init_ex(m, snap, qbits, 0, 0);
 }
 
+/* KV_BITS=8: KV-cache int8 con scala per (testa_kv, posizione). Default 0
+ * (f32): la numerica di REF non cambia mai in silenzio. */
+static int g_kv_bits = 0;
+
+/* riga id dell'embedding -> dst[D] moltiplicata per scale (gemma passa
+ * sqrt(D), qwen 1): f32 residente, int8 dequant, oppure micro-RSS (lettura
+ * della sola riga dal disco; drop=0, le righe calde sono minuscole). Era
+ * open-coded in tre punti fra i due motori. */
+static void embed_row(Model *m, int id, float scale, float *dst) {
+    int D = m->c.hidden;
+    if (m->embed) {
+        const float *er = m->embed + (int64_t)id*D;
+        if (scale == 1.f) memcpy(dst, er, D*sizeof(float));
+        else for (int i = 0; i < D; i++) dst[i] = er[i] * scale;
+    } else if (m->embed_q) {
+        const int8_t *er = m->embed_q + (int64_t)id*D;
+        float es = m->embed_qs[id] * scale;
+        for (int i = 0; i < D; i++) dst[i] = er[i] * es;
+    } else {
+        st_read_slice_f32(&m->S, "model.embed_tokens.weight", (int64_t)id*D, D, dst, 0);
+        if (scale != 1.f) for (int i = 0; i < D; i++) dst[i] *= scale;
+    }
+}
+
+/* ---------- KV-cache: pezzi comuni di kv_alloc (qwen e gemma) ----------
+ * Prologo: array di puntatori per-layer + scratch degli score. Lo scratch e'
+ * dimensionato QUI perche' THREADS viene applicato prima (engine_main) e
+ * OMP_DYNAMIC=FALSE tiene il team fisso: alzare i thread dopo kv_alloc non e'
+ * supportato. Al motore restano solo le decisioni per-layer (quale saltare,
+ * eventuale aliasing kv-shared). */
+static void kv_arrays_alloc(Model *m, int max_t) {
+    Cfg *c = &m->c;
+    m->max_t = max_t; m->kv_len = 0;
+    m->att_sc = falloc((int64_t)omp_get_max_threads() * max_t);
+    m->K  = bzalloc(c->n_layers * sizeof(float*),  "array K");
+    m->V  = bzalloc(c->n_layers * sizeof(float*),  "array V");
+    m->K8 = bzalloc(c->n_layers * sizeof(int8_t*), "array K8");
+    m->V8 = bzalloc(c->n_layers * sizeof(int8_t*), "array V8");
+    m->Ks = bzalloc(c->n_layers * sizeof(float*),  "array Ks");
+    m->Vs = bzalloc(c->n_layers * sizeof(float*),  "array Vs");
+}
+
+/* un layer di KV: f32, oppure int8 + scala per (testa, pos) con KV_BITS=8 */
+static void kv_layer_alloc(Model *m, int i, int KV, int hd, int max_t) {
+    int64_t n = (int64_t)KV * max_t * hd;
+    if (g_kv_bits == 8) {                    /* 4x meno RAM per la cache */
+        m->K8[i] = balloc(n, "KV int8"); m->V8[i] = balloc(n, "KV int8");
+        m->Ks[i] = falloc((int64_t)KV * max_t);
+        m->Vs[i] = falloc((int64_t)KV * max_t);
+    } else {
+        m->K[i] = falloc(n);
+        m->V[i] = falloc(n);
+    }
+}
+
 /* ---------- prefill a blocchi (PREFILL_CHUNK) ----------
  * Le attivazioni del prefill crescono con S (mlp: 2*S*inter f32 — 1.6 GB a
  * S=4096 su un 4B) e lo scratch statico di matmul_q_s resta a S*I per sempre:
@@ -422,10 +477,6 @@ static void model_init(Model *m, const char *snap, int qbits) {
  * stash) esistono solo per l'ultimo token del prompt, come non-chunked. */
 static int g_prefill_chunk = 0;
 static int g_skip_logits = 0;
-
-/* KV_BITS=8: KV-cache int8 con scala per (testa_kv, posizione). Default 0
- * (f32): la numerica di REF non cambia mai in silenzio. */
-static int g_kv_bits = 0;
 
 static float *step_chunked(Model *m, const int *ids, int S, int pos_base) {
     int C = g_prefill_chunk;

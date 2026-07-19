@@ -388,36 +388,13 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             int qpos = pos_base + s;
             int t0 = l->type == LT_FULL ? 0 : (qpos - c->window + 1 > 0 ? qpos - c->window + 1 : 0);
             const float *qv = q + s*qw + (int64_t)hh*hd;
-            if (K8c) {
-                /* le scale si indicizzano sul t ASSOLUTO (slot), lo score sul
-                 * buffer relativo alla finestra (t-t0); q resta f32 */
-                for (int t = t0; t <= qpos; t++) {
-                    int64_t slot = (int64_t)kvh*m->max_t + t;
-                    sc[t-t0] = Ksc[slot] * dot_f32i8(qv, K8c + slot*hd, hd) * scale;
-                }
-            } else {
-                for (int t = t0; t <= qpos; t++) {
-                    const float *kr = Kc + ((int64_t)kvh*m->max_t + t)*hd;
-                    sc[t-t0] = dot_f32(qv, kr, hd) * scale;
-                }
-            }
+            int64_t kvbase = (int64_t)kvh * m->max_t;
+            if (K8c) att_scores_i8(sc, qv, K8c, Ksc, kvbase, t0, qpos, hd, scale);
+            else     att_scores_f32(sc, qv, Kc, kvbase, t0, qpos, hd, scale);
             softmax_row(sc, qpos-t0+1);
             float *cx = ctx + s*qw + (int64_t)hh*hd;
-            for (int dd = 0; dd < hd; dd++) cx[dd] = 0;
-            if (V8c) {
-                for (int t = t0; t <= qpos; t++) {
-                    int64_t slot = (int64_t)kvh*m->max_t + t;
-                    const int8_t *vr = V8c + slot*hd;
-                    float a = sc[t-t0] * Vsc[slot];    /* dequant fuso nell'accumulo */
-                    for (int dd = 0; dd < hd; dd++) cx[dd] += a * (float)vr[dd];
-                }
-            } else {
-                for (int t = t0; t <= qpos; t++) {
-                    const float *vr = Vc + ((int64_t)kvh*m->max_t + t)*hd;
-                    float a = sc[t-t0];
-                    for (int dd = 0; dd < hd; dd++) cx[dd] += a * vr[dd];
-                }
-            }
+            if (V8c) att_accum_i8(cx, sc, V8c, Vsc, kvbase, t0, qpos, hd);
+            else     att_accum_f32(cx, sc, Vc, kvbase, t0, qpos, hd);
         }
     }
     mat_apply(out, ctx, &l->o, S);
@@ -451,13 +428,7 @@ static void ple_inputs(Model *m, const int *ids, int S, float *out /*[S, n_layer
     for (int s = 0; s < S; s++) {
         int id = ids[s] < c->ple_vocab ? ids[s] : 0;
         /* contesto: proiezione dell'embedding principale scalato */
-        if (m->embed)
-            for (int i = 0; i < D; i++) xemb[i] = m->embed[(int64_t)id*D + i] * emb_scale;
-        else {                                    /* QBITS=8: dequant della riga */
-            const int8_t *er = m->embed_q + (int64_t)id*D;
-            float es = m->embed_qs[id] * emb_scale;
-            for (int i = 0; i < D; i++) xemb[i] = er[i] * es;
-        }
+        embed_row(m, id, emb_scale, xemb);
         mat_apply(proj, xemb, &m->ple_model_proj, 1);
         const float *pe = m->ple_embed + (int64_t)id*NL*P;
         float *os = out + (int64_t)s*NL*P;
@@ -500,16 +471,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     float emb_scale = sqrtf((float)D);
     float *x = falloc((int64_t)S*D);
-    for (int s = 0; s < S; s++) {
-        float *xs = x + (int64_t)s*D;
-        if (m->embed)
-            for (int i = 0; i < D; i++) xs[i] = m->embed[(int64_t)ids[s]*D + i] * emb_scale;
-        else {                                    /* QBITS=8: dequant della riga */
-            const int8_t *er = m->embed_q + (int64_t)ids[s]*D;
-            float es = m->embed_qs[ids[s]] * emb_scale;
-            for (int i = 0; i < D; i++) xs[i] = er[i] * es;
-        }
-    }
+    for (int s = 0; s < S; s++) embed_row(m, ids[s], emb_scale, x + (int64_t)s*D);
     float *ple = NULL;
     if (c->ple_dim > 0) {
         ple = falloc((int64_t)S*c->n_layers*c->ple_dim);
@@ -557,27 +519,12 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
 
 static void kv_alloc(Model *m, int max_t) {
     Cfg *c = &m->c;
-    m->max_t = max_t; m->kv_len = 0;
-    /* scratch punteggi dimensionato QUI: THREADS viene applicato prima, in
-     * engine_main, e OMP_DYNAMIC=FALSE tiene il team fisso; alzare il numero
-     * di thread dopo kv_alloc non e' supportato. */
-    m->att_sc = falloc((int64_t)omp_get_max_threads() * max_t);
-    m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
-    m->K8 = calloc(c->n_layers, sizeof(int8_t*)); m->V8 = calloc(c->n_layers, sizeof(int8_t*));
-    m->Ks = calloc(c->n_layers, sizeof(float*)); m->Vs = calloc(c->n_layers, sizeof(float*));
+    kv_arrays_alloc(m, max_t);
     for (int i = 0; i < c->n_layers; i++) {
         if (c->kv_src[i] != i) continue;           /* i layer kv-shared leggono dal sorgente */
         int hd = c->ltype[i] == LT_FULL ? c->ghd : c->head_dim;
         int KV = c->ltype[i] == LT_FULL ? c->n_gkv : c->n_kv_heads;
-        int64_t n = (int64_t)KV * max_t * hd;
-        if (g_kv_bits == 8) {
-            m->K8[i] = balloc(n, "KV int8"); m->V8[i] = balloc(n, "KV int8");
-            m->Ks[i] = falloc((int64_t)KV * max_t);
-            m->Vs[i] = falloc((int64_t)KV * max_t);
-        } else {
-            m->K[i] = falloc(n);
-            m->V[i] = falloc(n);
-        }
+        kv_layer_alloc(m, i, KV, hd, max_t);
     }
     for (int i = 0; i < c->n_layers; i++)
         if (c->kv_src[i] != i) {                   /* alias del sorgente, scale comprese */
@@ -585,6 +532,7 @@ static void kv_alloc(Model *m, int max_t) {
             m->K8[i] = m->K8[c->kv_src[i]]; m->V8[i] = m->V8[c->kv_src[i]];
             m->Ks[i] = m->Ks[c->kv_src[i]]; m->Vs[i] = m->Vs[c->kv_src[i]];
         }
+    state_reset(m);   /* no-op per gemma: simmetria col gemello qwen */
 }
 
 /* costruisce il turno chat Gemma */

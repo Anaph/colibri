@@ -588,37 +588,13 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             int kvh = hh / G;                 /* GQA: testa kv condivisa */
             int qpos = pos_base + s;
             const float *qv = q + s*qw + (int64_t)hh*hd;
-            if (kv8) {
-                /* q resta f32 (errore di quantizzazione UNILATERALE, solo su K) */
-                const int8_t *K8c = m->K8[layer]; const float *Ksc = m->Ks[layer];
-                for (int t = 0; t <= qpos; t++) {
-                    int64_t slot = (int64_t)kvh*m->max_t + t;
-                    sc[t] = Ksc[slot] * dot_f32i8(qv, K8c + slot*hd, hd) * scale;
-                }
-            } else {
-                for (int t = 0; t <= qpos; t++) {
-                    const float *kr = m->K[layer] + ((int64_t)kvh*m->max_t + t)*hd;
-                    sc[t] = dot_f32(qv, kr, hd) * scale;
-                }
-            }
+            int64_t kvbase = (int64_t)kvh * m->max_t;
+            if (kv8) att_scores_i8(sc, qv, m->K8[layer], m->Ks[layer], kvbase, 0, qpos, hd, scale);
+            else     att_scores_f32(sc, qv, m->K[layer], kvbase, 0, qpos, hd, scale);
             softmax_row(sc, qpos+1);
             float *cx = ctx + s*qw + (int64_t)hh*hd;
-            for (int dd = 0; dd < hd; dd++) cx[dd] = 0;
-            if (kv8) {
-                const int8_t *V8c = m->V8[layer]; const float *Vsc = m->Vs[layer];
-                for (int t = 0; t <= qpos; t++) {
-                    int64_t slot = (int64_t)kvh*m->max_t + t;
-                    const int8_t *vr = V8c + slot*hd;
-                    float a = sc[t] * Vsc[slot];       /* dequant fuso nell'accumulo */
-                    for (int dd = 0; dd < hd; dd++) cx[dd] += a * (float)vr[dd];
-                }
-            } else {
-                for (int t = 0; t <= qpos; t++) {
-                    const float *vr = m->V[layer] + ((int64_t)kvh*m->max_t + t)*hd;
-                    float a = sc[t];
-                    for (int dd = 0; dd < hd; dd++) cx[dd] += a * vr[dd];
-                }
-            }
+            if (kv8) att_accum_i8(cx, sc, m->V8[layer], m->Vs[layer], kvbase, 0, qpos, hd);
+            else     att_accum_f32(cx, sc, m->V[layer], kvbase, 0, qpos, hd);
         }
     }
     if (gate) {                            /* Qwen3.5: gating per-elemento sull'output */
@@ -737,16 +713,7 @@ static void mlp(Model *m, Layer *l, float *x, int S, float *out) {
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     float *x = falloc((int64_t)S*D);
-    for (int s = 0; s < S; s++) {
-        if (m->embed)
-            memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
-        else if (m->embed_q) {                     /* QBITS=8: dequant della riga */
-            const int8_t *er = m->embed_q + (int64_t)ids[s]*D;
-            float es = m->embed_qs[ids[s]], *xs = x + (int64_t)s*D;
-            for (int i = 0; i < D; i++) xs[i] = er[i] * es;
-        } else                                     /* micro-RSS: gather della sola riga dal disco (drop=0: righe calde minuscole) */
-            st_read_slice_f32(&m->S, "model.embed_tokens.weight", (int64_t)ids[s]*D, D, x + (int64_t)s*D, 0);
-    }
+    for (int s = 0; s < S; s++) embed_row(m, ids[s], 1.f, x + (int64_t)s*D);
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
     /* gli scratch di streaming esistono solo nel percorso MEM_GB classico;
      * in micro-RSS lo streaming avviene DENTRO mat_apply, matrice per matrice */
@@ -785,25 +752,10 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
 
 static void kv_alloc(Model *m, int max_t) {
     Cfg *c = &m->c;
-    m->max_t = max_t; m->kv_len = 0;
-    /* scratch punteggi dimensionato QUI: THREADS viene applicato prima, in
-     * engine_main, e OMP_DYNAMIC=FALSE tiene il team fisso; alzare il numero
-     * di thread dopo kv_alloc non e' supportato. */
-    m->att_sc = falloc((int64_t)omp_get_max_threads() * max_t);
-    m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
-    m->K8 = calloc(c->n_layers, sizeof(int8_t*)); m->V8 = calloc(c->n_layers, sizeof(int8_t*));
-    m->Ks = calloc(c->n_layers, sizeof(float*)); m->Vs = calloc(c->n_layers, sizeof(float*));
+    kv_arrays_alloc(m, max_t);
     for (int i = 0; i < c->n_layers; i++) {
         if (c->ltype[i] == LT_LINEAR) continue;  /* i layer lineari usano lo stato, non la KV */
-        int64_t n = (int64_t)c->n_kv_heads * max_t * c->head_dim;
-        if (g_kv_bits == 8) {                    /* int8 + scala per (testa, pos): 4x meno RAM */
-            m->K8[i] = balloc(n, "KV int8"); m->V8[i] = balloc(n, "KV int8");
-            m->Ks[i] = falloc((int64_t)c->n_kv_heads * max_t);
-            m->Vs[i] = falloc((int64_t)c->n_kv_heads * max_t);
-        } else {
-            m->K[i] = falloc(n);
-            m->V[i] = falloc(n);
-        }
+        kv_layer_alloc(m, i, c->n_kv_heads, c->head_dim, max_t);
     }
     state_reset(m);
 }
