@@ -562,9 +562,9 @@ int qt_tiny_hybrid(void) {
 }
 
 /* ---- MEM_GB/MEM_FRAC: parita' token con streaming ---- */
-static int qt_run8_budget(const char *dir, int64_t budget, int *out, int *resident_out) {
+static int qt_run8_budget(const char *dir, int qbits, int64_t budget, int *out, int *resident_out) {
     Model m;
-    model_init_ex(&m, dir, 0, budget, 16);
+    model_init_ex(&m, dir, qbits, budget, 16);
     if (resident_out) *resident_out = m.n_resident;
     kv_alloc(&m, 16);
     int prompt[3] = {1,2,3};
@@ -595,11 +595,30 @@ int qt_memknob_parity(void) {
     qt_write_hybrid_dir(dirs[1]);
     for (int d = 0; d < 2; d++) {
         int a[16], b[16], cc[16]; int r0, r1, r2;
-        CHECK(qt_run8_budget(dirs[d], 0, a, &r0) == 0);                    /* classico */
-        CHECK(qt_run8_budget(dirs[d], 1, b, &r1) == 0);                    /* R=0: tutto stream */
-        CHECK(qt_run8_budget(dirs[d], (int64_t)1<<40, cc, &r2) == 0);      /* R=tutti */
+        CHECK(qt_run8_budget(dirs[d], 0, 0, a, &r0) == 0);                 /* classico */
+        CHECK(qt_run8_budget(dirs[d], 0, 1, b, &r1) == 0);                 /* R=0: tutto stream */
+        CHECK(qt_run8_budget(dirs[d], 0, (int64_t)1<<40, cc, &r2) == 0);   /* R=tutti */
         CHECK(r1 == 0 && r0 == 2 && r2 == 2);
         for (int i = 0; i < 11; i++) CHECK(a[i]==b[i] && a[i]==cc[i]);     /* stream f32 == residente f32 */
+    }
+    return 0;
+}
+
+/* QBITS=8 + streaming: le matrici streamate girano int8 come le residenti;
+ * la quantizzazione per riga rende i token IDENTICI a tutto-residente */
+int qt_memknob_q8_parity(void) {
+    char dense[512], hyb[512];
+    snprintf(dense, sizeof(dense), "%s", tst_dir("qwen_tiny_model"));
+    snprintf(hyb,   sizeof(hyb),   "%s", tst_dir("qwen_tiny_hybrid"));
+    const char *dirs[2] = { dense, hyb };
+    qt_write_dense_dir(dirs[0]);
+    qt_write_hybrid_dir(dirs[1]);
+    for (int d = 0; d < 2; d++) {
+        int a[16], b[16]; int r0, r1;
+        CHECK(qt_run8_budget(dirs[d], 8, 0, a, &r0) == 0);                 /* int8 residente */
+        CHECK(qt_run8_budget(dirs[d], 8, 1, b, &r1) == 0);                 /* int8 streamato (R=0) */
+        CHECK(r0 == 2 && r1 == 0);
+        for (int i = 0; i < 11; i++) CHECK(a[i]==b[i]);
     }
     return 0;
 }

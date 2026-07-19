@@ -20,6 +20,7 @@ int qt_tiny_qbits4(void);
 int qt_tiny_hybrid(void);
 int qt_memknob_parity(void);
 int qt_memknob_env(void);
+int qt_memknob_q8_parity(void);
 int qt_micro_parity(void);
 int qt_embed_q8(void);
 int qt_stw_st_parity(void);
@@ -61,6 +62,7 @@ C_TEST(QwenTiny,     Qbits4Deterministic, qt_tiny_qbits4)
 C_TEST(QwenTiny,     HybridDeterministic, qt_tiny_hybrid)
 C_TEST(QwenMemKnob,  StreamTokenParity,   qt_memknob_parity)
 C_TEST(QwenMemKnob,  EnvPrecedence,       qt_memknob_env)
+C_TEST(QwenMemKnob,  StreamInt8Parity,    qt_memknob_q8_parity)
 C_TEST(QwenMicro,    StreamBitExact,      qt_micro_parity)
 C_TEST(QwenQuant,    EmbedQ8ChunkExact,   qt_embed_q8)
 C_TEST(QwenLora,     StwStParity,         qt_stw_st_parity)

@@ -173,9 +173,37 @@ static int64_t layer_f32_bytes(Model *m, int li) {
     return b;
 }
 
-/* rilettura di un layer streamato: tutte le matrici in stream_buf (f32) */
+/* rilettura di un layer streamato. QBITS=0/4: f32 in stream_buf come sempre
+ * (per int4 l'impacchettamento a OGNI step costerebbe piu' del risparmio).
+ * QBITS=8: lettura a blocchi di righe + quantize_rows nello scratch int8 —
+ * il transiente f32 e' un blocco, lo scratch e' 4x piu' piccolo e le matrici
+ * streamate girano sullo stesso kernel int8 di quelle residenti (la
+ * quantizzazione per riga rende il risultato bit-identico al load residente). */
 static void layer_stream_in(Model *m, int li) {
     MatRef r[MAX_LAYER_MATS]; int n = layer_matrefs(m, li, r);
+    if (m->qbits == 8) {
+        static float *chunk = NULL; static int64_t ccap = 0;
+        int64_t qoff = 0, soff = 0;
+        for (int j = 0; j < n; j++) {
+            int O = r[j].O, I = r[j].I;
+            int rows = (int)((4 << 20) / ((int64_t)I * 4)); if (rows < 1) rows = 1;
+            if ((int64_t)rows*I > ccap) {
+                ccap = (int64_t)rows*I;
+                chunk = realloc(chunk, ccap*sizeof(float));
+                if (!chunk) { fprintf(stderr, "OOM stream chunk\n"); exit(1); }
+            }
+            for (int64_t o = 0; o < O; o += rows) {
+                int64_t rr = O - o < rows ? O - o : rows;
+                st_read_slice_f32(&m->S, r[j].name, o*I, rr*I, chunk, 0);
+                quantize_rows(chunk, m->stream_q + qoff + o*I, m->stream_qs + soff + o, (int)rr, I, 8);
+            }
+            r[j].mat->q = m->stream_q + qoff; r[j].mat->qs = m->stream_qs + soff;
+            r[j].mat->f = NULL; r[j].mat->sh = NULL; r[j].mat->q4 = NULL; r[j].mat->gs = 0;
+            r[j].mat->O = O; r[j].mat->I = I;
+            qoff += (int64_t)O*I; soff += O;
+        }
+        return;
+    }
     int64_t off = 0;
     for (int j = 0; j < n; j++) {
         st_read_f32(&m->S, r[j].name, m->stream_buf + off, 0);  /* drop=0: la page cache aiuta */
@@ -309,7 +337,9 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
         if (!m->lm_tied) fixed += vd;
         fixed += (int64_t)c->n_layers * 8 * D * 4;                  /* norme/vettori: stima larga */
         fixed += fixed_bytes(m, ctx_hint > 0 ? ctx_hint : 4096);    /* hook: KV, PLE... */
-        int64_t used = fixed + max_lb;                              /* scratch di streaming */
+        /* scratch di streaming: int8 con QBITS=8 (layer_stream_in quantizza), f32 altrimenti */
+        int64_t scratch = (m->qbits == 8) ? max_lb/4 + max_lb/64 : max_lb;
+        int64_t used = fixed + scratch;
         int R = 0;
         for (; R < c->n_layers; R++) {
             int64_t lb = layer_f32_bytes(m, R);
@@ -320,12 +350,12 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
         }
         m->n_resident = R;
         fprintf(stderr, "[" ENGINE_TAG "] budget %.2f GB -> %d/%d layer residenti (fisso %.2f GB, scratch %.2f GB)\n",
-                budget_bytes/1073741824.0, R, c->n_layers, fixed/1073741824.0, max_lb/1073741824.0);
+                budget_bytes/1073741824.0, R, c->n_layers, fixed/1073741824.0, scratch/1073741824.0);
 #if ENGINE_MICRO
-        /* il classico non scende sotto embed f32 + scratch: budget irrealizzabile */
-        if (budget_bytes < fixed + max_lb)
+        /* il classico non scende sotto embed + scratch: budget irrealizzabile */
+        if (budget_bytes < fixed + scratch)
             fprintf(stderr, "[" ENGINE_TAG "] budget sotto il pavimento residente (%.2f GB): per la RSS minima usa MICRO=1\n",
-                    (fixed + max_lb)/1073741824.0);
+                    (fixed + scratch)/1073741824.0);
 #endif
     }
     /* 3) matrici: residenti (QBITS onorato) o streamate (dims impostate, f=NULL) */
@@ -345,8 +375,24 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
             }
         }
     }
-    if (m->n_resident < c->n_layers)
-        m->stream_buf = falloc(max_lb/4);
+    if (m->n_resident < c->n_layers) {
+        /* scratch dimensionato sul massimo dei layer EFFETTIVAMENTE streamati
+         * (i >= n_resident), non sul massimo globale */
+        int64_t smax = 0, rmax = 0;
+        for (int i = m->n_resident; i < c->n_layers; i++) {
+            int64_t b = layer_f32_bytes(m, i); if (b > smax) smax = b;
+            MatRef r[MAX_LAYER_MATS]; int n = layer_matrefs(m, i, r);
+            int64_t rows = 0; for (int j = 0; j < n; j++) rows += r[j].O;
+            if (rows > rmax) rmax = rows;
+        }
+        if (m->qbits == 8) {
+            m->stream_q = malloc(smax/4);          /* int8: 1 byte per elemento f32 */
+            m->stream_qs = falloc(rmax);
+            if (!m->stream_q) { fprintf(stderr, "OOM stream_q\n"); exit(1); }
+        } else {
+            m->stream_buf = falloc(smax/4);
+        }
+    }
     m->load_s = now_s() - t0;
 }
 

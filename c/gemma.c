@@ -96,7 +96,8 @@ typedef struct {
     float *att_sc;              /* scratch punteggi attention: [n_thread][max_t] */
     /* streaming a budget (MEM_GB/MEM_FRAC), stessa semantica di qwen.c */
     int n_resident;
-    float *stream_buf;
+    float *stream_buf;                     /* scratch f32 (QBITS=0/4) */
+    int8_t *stream_q; float *stream_qs;    /* scratch int8+scale (QBITS=8) */
     double load_s;
 } Model;
 

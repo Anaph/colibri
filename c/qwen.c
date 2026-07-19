@@ -92,7 +92,8 @@ typedef struct {
     /* streaming a budget (MEM_GB/MEM_FRAC): i primi n_resident layer stanno in
      * RAM, gli altri vengono riletti dal disco a ogni step in stream_buf */
     int n_resident;
-    float *stream_buf;
+    float *stream_buf;                     /* scratch f32 (QBITS=0/4) */
+    int8_t *stream_q; float *stream_qs;    /* scratch int8+scale (QBITS=8) */
     double load_s;
 } Model;
 
@@ -713,12 +714,13 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
             st_read_slice_f32(&m->S, "model.embed_tokens.weight", (int64_t)ids[s]*D, D, x + (int64_t)s*D, 0);
     }
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
-    /* stream_buf esiste solo nel percorso MEM_GB classico; in micro-RSS lo
-     * streaming avviene DENTRO mat_apply, matrice per matrice */
-    if (m->stream_buf && m->n_resident < c->n_layers) layer_prefetch(m, m->n_resident);
+    /* gli scratch di streaming esistono solo nel percorso MEM_GB classico;
+     * in micro-RSS lo streaming avviene DENTRO mat_apply, matrice per matrice */
+    int strm = m->stream_buf != NULL || m->stream_q != NULL;
+    if (strm && m->n_resident < c->n_layers) layer_prefetch(m, m->n_resident);
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
-        if (m->stream_buf && i >= m->n_resident) {
+        if (strm && i >= m->n_resident) {
             layer_stream_in(m, i);                  /* rilegge il layer dal disco (f32) */
             if (i + 1 < c->n_layers && i + 1 >= m->n_resident) layer_prefetch(m, i + 1);
         }
