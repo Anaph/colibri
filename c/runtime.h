@@ -400,6 +400,35 @@ static void model_init(Model *m, const char *snap, int qbits) {
     model_init_ex(m, snap, qbits, 0, 0);
 }
 
+/* ---------- prefill a blocchi (PREFILL_CHUNK) ----------
+ * Le attivazioni del prefill crescono con S (mlp: 2*S*inter f32 — 1.6 GB a
+ * S=4096 su un 4B) e lo scratch statico di matmul_q_s resta a S*I per sempre:
+ * spezzare il prompt in blocchi <= C limita entrambi a una costante. E' un
+ * opt-in (default 0 = spento) perche' con MEM_GB ogni step() rilegge i layer
+ * streamati dal disco: N blocchi = N riletture del prompt.
+ * Bit-esattezza: ogni operazione per-token dipende solo dalla posizione
+ * ASSOLUTA (RoPE, scrittura KV, ricorrenza deltanet, PLE) e l'attention legge
+ * la KV scritta dalle posizioni precedenti, identica comunque si spezzi;
+ * matmul_q_s quantizza le attivazioni PER RIGA, quindi e' batch-invariante.
+ * g_skip_logits: sui blocchi intermedi il motore esce da step() PRIMA di
+ * final-norm/lm_head (e dello stash TTA) e ritorna NULL — i logits (e lo
+ * stash) esistono solo per l'ultimo token del prompt, come non-chunked. */
+static int g_prefill_chunk = 0;
+static int g_skip_logits = 0;
+
+static float *step_chunked(Model *m, const int *ids, int S, int pos_base) {
+    int C = g_prefill_chunk;
+    if (C <= 0 || S <= C) return step(m, ids, S, pos_base);
+    int done = 0;
+    for (; S - done > C; done += C) {
+        g_skip_logits = 1;
+        float *lo = step(m, ids + done, C, pos_base + done);
+        g_skip_logits = 0;
+        if (lo) free(lo);              /* i motori ritornano NULL quando saltano */
+    }
+    return step(m, ids + done, S - done, pos_base + done);
+}
+
 /* ---------- ref.json (validazione) ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
@@ -424,7 +453,7 @@ static int run_ref(Model *m, const char *refpath) {
     memcpy(out, prompt, np*sizeof(int));
     g_temp = 0;                                    /* la validazione e' greedy */
     double t0 = now_s();
-    float *logit = step(m, prompt, np, 0);
+    float *logit = step_chunked(m, prompt, np, 0);
     int len = np;
     for (int s = 0; s < n_new; s++) {
         int best = argmax_v(logit, m->c.vocab);
@@ -450,7 +479,7 @@ static int run_ref(Model *m, const char *refpath) {
 static int gen_turn(Model *m, Tok *T, int *hist, int len, int k, int n_new, int echo, int *stopped) {
     int dump = getenv("TOKENS") && atoi(getenv("TOKENS"));
     double t0 = now_s();
-    float *logit = step(m, hist + len, k, len);      /* PREFILL */
+    float *logit = step_chunked(m, hist + len, k, len);  /* PREFILL (a blocchi se PREFILL_CHUNK) */
     ENGINE_LOGITS_HOOK(m, logit);
     double tpre = now_s() - t0;
     int base = len + k, ng = 0; *stopped = 0;
@@ -539,6 +568,7 @@ static int engine_main(int argc, char **argv) {
             fprintf(stderr, "QGROUP deve essere 0 (scala per riga) o un multiplo di 16\n"); return 1; }
     }
     int ngen  = getenv("NGEN") ? atoi(getenv("NGEN")) : 256;
+    if (getenv("PREFILL_CHUNK")) g_prefill_chunk = atoi(getenv("PREFILL_CHUNK"));
     /* MICRO=1: micro-RSS. La KV-cache resta l'unica voce grande -> il default
      * di contesto scende a 256 (CTX esplicito vince sempre). */
     const char *mi_ = getenv("MICRO");

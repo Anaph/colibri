@@ -236,6 +236,25 @@ int gm_tiny(void) {
     return 0;
 }
 
+/* PREFILL_CHUNK bit-esatto anche con sliding window (window=4 < prompt=11,
+ * confini dei blocchi DENTRO la finestra) */
+int gm_prefill_chunk(void) {
+    const char *dir = tst_dir("gemma_tiny_model");
+    gm_write_tiny(dir, 0, 0);
+    static const int prompt[11] = {1,2,3,1,2,3,1,2,3,1,2};
+    Model a; model_init(&a, dir, 0);
+    kv_alloc(&a, 16);
+    float *la = step(&a, prompt, 11, 0);
+    Model b; model_init(&b, dir, 0);
+    kv_alloc(&b, 16);
+    g_prefill_chunk = 3;
+    float *lb = step_chunked(&b, prompt, 11, 0);
+    g_prefill_chunk = 0;
+    CHECK(memcmp(la, lb, a.c.vocab*sizeof(float)) == 0);
+    free(la); free(lb);
+    return 0;
+}
+
 int gm_tiny_shared(void) {
     const char *dir = tst_dir("gemma_tiny_shared");
     gm_write_tiny(dir, 1, 0);                      /* ultimo layer kv-shared */

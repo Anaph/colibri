@@ -509,6 +509,8 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         if (c->ple_dim > 0) ple_apply(m, l, i, ple, x, S);
     }
     m->kv_len = pos_base + S;
+    /* blocco intermedio di un prefill a blocchi: niente final-norm/lm_head */
+    if (g_skip_logits) { free(x); free(nrm); free(tmp); if (ple) free(ple); return NULL; }
     float *last = falloc(D);
     gnorm_row(c, last, x + (int64_t)(S-1)*D, m->final_norm, D);
     float *logit = falloc(c->vocab);

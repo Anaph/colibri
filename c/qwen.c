@@ -733,6 +733,9 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
     }
     m->kv_len = pos_base + S;
+    /* blocco intermedio di un prefill a blocchi: KV/stati aggiornati, ma
+     * niente final-norm/lm_head/stash TTA (validi solo per l'ultimo token) */
+    if (g_skip_logits) { free(x); free(nrm); free(tmp); return NULL; }
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     if ((g_tta.mode == TTA_CACHE || g_tta.mode == TTA_LORA) && g_tta.alloc) {

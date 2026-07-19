@@ -706,6 +706,40 @@ int qt_micro_parity(void) {
     return 0;
 }
 
+/* ---- PREFILL_CHUNK: prefill a blocchi bit-esatto al prefill intero ---- */
+static int qt_prefill_chunk_dir(const char *dir, int hybrid) {
+    static const int prompt[11] = {1,2,3,1,2,3,1,2,3,1,2};
+    Model a; model_init(&a, dir, 0);
+    CHECK(a.c.hybrid == hybrid);
+    kv_alloc(&a, 16);
+    float *la = step(&a, prompt, 11, 0);
+    Model b; model_init(&b, dir, 0);
+    kv_alloc(&b, 16);
+    g_prefill_chunk = 3;                    /* 11 = 3+3+3+2: esercita blocchi pieni e coda */
+    float *lb = step_chunked(&b, prompt, 11, 0);
+    g_prefill_chunk = 0;
+    CHECK(memcmp(la, lb, a.c.vocab*sizeof(float)) == 0);
+    CHECK(a.kv_len == b.kv_len && b.kv_len == 11);
+    /* il decode successivo parte dallo stesso stato: ancora bit-esatto */
+    int t = argmax_v(la, a.c.vocab);
+    float *da = step(&a, &t, 1, 11);
+    float *db = step(&b, &t, 1, 11);
+    CHECK(memcmp(da, db, a.c.vocab*sizeof(float)) == 0);
+    free(la); free(lb); free(da); free(db);
+    return 0;
+}
+
+int qt_prefill_chunk(void) {
+    char dense[512], hyb[512];
+    snprintf(dense, sizeof(dense), "%s", tst_dir("qwen_tiny_model"));
+    snprintf(hyb,   sizeof(hyb),   "%s", tst_dir("qwen_tiny_hybrid"));
+    qt_write_dense_dir(dense);
+    qt_write_hybrid_dir(hyb);
+    CHECK(qt_prefill_chunk_dir(dense, 0) == 0);
+    CHECK(qt_prefill_chunk_dir(hyb, 1) == 0);     /* deltanet: ricorrenza gia' per token */
+    return 0;
+}
+
 /* ---- LoRA runtime: writer stw, loader, no-op e effetto ---- */
 
 /* parita' stw <-> st: quello che stw_write scrive, st_init_file lo rilegge uguale */
@@ -1189,6 +1223,35 @@ int qt_tta_ppl_proxy(void) {
     double nll_on = tta_drive(&m2, seq, 25, NULL);
     fprintf(stderr, "tta ppl-proxy: nll off=%.3f on=%.3f\n", nll_off, nll_on);
     CHECK(nll_on < nll_off);
+    tta_setup(TTA_OFF, 0, 0);       /* non inquinare gli altri test */
+    return 0;
+}
+
+/* ---- PREFILL_CHUNK + TTA: lo stash h_cur e' quello dell'ULTIMO token del
+ * prompt, identico al prefill non a blocchi ---- */
+int qt_prefill_chunk_tta(void) {
+    const char *dir = tst_dir("qwen_tiny_model");
+    qt_write_dense_dir(dir);
+    static const int prompt[11] = {1,2,3,1,2,3,1,2,3,1,2};
+    float ha[16];
+    Model a; model_init(&a, dir, 0);
+    tta_setup(TTA_CACHE, 0.1f, 0);
+    tta_ensure(&a);
+    kv_alloc(&a, 16);
+    float *la = step(&a, prompt, 11, 0);
+    CHECK(g_tta.h_valid);
+    memcpy(ha, g_tta.h_cur, a.c.hidden*sizeof(float));
+    Model b; model_init(&b, dir, 0);
+    tta_setup(TTA_CACHE, 0.1f, 0);
+    tta_ensure(&b);
+    kv_alloc(&b, 16);
+    g_prefill_chunk = 4;
+    float *lb = step_chunked(&b, prompt, 11, 0);
+    g_prefill_chunk = 0;
+    CHECK(g_tta.h_valid);
+    CHECK(memcmp(ha, g_tta.h_cur, b.c.hidden*sizeof(float)) == 0);
+    CHECK(memcmp(la, lb, a.c.vocab*sizeof(float)) == 0);
+    free(la); free(lb);
     tta_setup(TTA_OFF, 0, 0);       /* non inquinare gli altri test */
     return 0;
 }

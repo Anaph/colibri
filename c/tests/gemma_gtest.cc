@@ -8,6 +8,7 @@ int gm_rmsnorm(void);
 int gm_sliding(void);
 int gm_tiny(void);
 int gm_tiny_shared(void);
+int gm_prefill_chunk(void);
 int gm_tiny_keqv(void);
 int gm_memknob_parity(void);
 }
@@ -21,5 +22,6 @@ C_TEST(GemmaNorm,    BothConventions,    gm_rmsnorm)
 C_TEST(GemmaAttn,    SlidingVsBruteForce, gm_sliding)
 C_TEST(GemmaTiny,    HybridDeterministic, gm_tiny)
 C_TEST(GemmaTiny,    KvShared,           gm_tiny_shared)
+C_TEST(GemmaPrefill, ChunkBitExact,      gm_prefill_chunk)
 C_TEST(GemmaTiny,    KEqualsV,           gm_tiny_keqv)
 C_TEST(GemmaMemKnob, StreamTokenParity,  gm_memknob_parity)
