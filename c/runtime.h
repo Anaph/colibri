@@ -109,17 +109,34 @@ static float *load_t(Model *m, const char *name, int64_t expect) {
     return p;
 }
 
-/* carica [O,I]; con QBITS=8 tiene solo int8+scala e libera l'f32 */
-static void load_mat(Model *m, Mat *w, const char *name, int O, int I) {
+/* gruppo delle scale int4 (QGROUP): 32 = blocco Q4_0 di GGUF; 0 = per riga */
+static int g_qgroup = 32;
+
+/* carica [O,I] e quantizza secondo bits: 0=f32, 8=int8+scala per riga,
+ * 4=int4 impacchettato con scale per gruppo (g_qgroup; 0 -> per riga) */
+static void load_mat_bits(Model *m, Mat *w, const char *name, int O, int I, int bits) {
     w->O = O; w->I = I; w->q = NULL; w->qs = NULL; w->sh = NULL; w->sname = NULL;
     w->q4 = NULL; w->gs = 0;
     w->f = load_t(m, name, (int64_t)O*I);
-    if (m->qbits == 8) {
+    if (bits == 8) {
         w->q = malloc((int64_t)O*I); w->qs = falloc(O);
         if (!w->q) { fprintf(stderr,"OOM quant %s\n",name); exit(1); }
         quantize_rows(w->f, w->q, w->qs, O, I, 8);
         free(w->f); w->f = NULL;
+    } else if (bits == 4) {
+        int gs = g_qgroup;
+        int64_t rb = ((int64_t)I+1)/2, ng = gs > 0 ? ((int64_t)I+gs-1)/gs : 1;
+        w->q4 = malloc((int64_t)O*rb); w->qs = falloc((int64_t)O*ng);
+        if (!w->q4) { fprintf(stderr,"OOM quant %s\n",name); exit(1); }
+        if (gs > 0) pack_int4_grouped(w->f, w->q4, w->qs, O, I, gs);
+        else pack_int4(w->f, w->q4, w->qs, O, I);
+        w->gs = gs;
+        free(w->f); w->f = NULL;
     }
+}
+
+static void load_mat(Model *m, Mat *w, const char *name, int O, int I) {
+    load_mat_bits(m, w, name, O, I, m->qbits);
 }
 
 /* embed int8 per riga (QBITS=8): letto e quantizzato A BLOCCHI di righe, il
@@ -268,24 +285,26 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
         exit(1);
 #endif
     }
-    /* QBITS=8 copre anche l'embed: 4x meno RAM sulla voce residente piu'
-     * grande e, con lm_head tied, il GEMV piu' grosso del decode passa al
-     * kernel int8 (stessa classe di errore delle altre matrici quantizzate) */
-    if (m->qbits == 8) load_embed_q8(m);
+    /* QBITS!=0 copre anche l'embed, ma SEMPRE a int8 (anche con QBITS=4):
+     * l'lm_head e' il GEMV piu' sensibile alla quantizzazione e l'int4 li'
+     * risparmierebbe poco rispetto alle matrici dei layer */
+    if (m->qbits) load_embed_q8(m);
     else m->embed = load_t(m, "model.embed_tokens.weight", (int64_t)c->vocab*D);
     if (m->lm_tied) {
         m->lm_head.f = m->embed; m->lm_head.q = m->embed_q; m->lm_head.qs = m->embed_qs;
         m->lm_head.sh=NULL; m->lm_head.sname=NULL;
         m->lm_head.O = c->vocab; m->lm_head.I = D;
     } else {
-        load_mat(m, &m->lm_head, "lm_head.weight", c->vocab, D);
+        /* testa non condivisa: int8 anche con QBITS=4 (vedi sopra) */
+        load_mat_bits(m, &m->lm_head, "lm_head.weight", c->vocab, D, m->qbits == 4 ? 8 : m->qbits);
     }
     /* 2) budget -> quanti layer di matrici stanno residenti */
     m->n_resident = c->n_layers;
     if (budget_bytes > 0) {
-        /* embed (e l'eventuale lm_head separato): f32 oppure int8+scala */
-        int64_t vd = (m->qbits == 8) ? (int64_t)c->vocab*D + (int64_t)c->vocab*4
-                                     : (int64_t)c->vocab*D*4;
+        /* embed (e l'eventuale lm_head separato): f32 oppure int8+scala
+         * (con QBITS=4 embed e testa restano comunque int8) */
+        int64_t vd = m->qbits ? (int64_t)c->vocab*D + (int64_t)c->vocab*4
+                              : (int64_t)c->vocab*D*4;
         int64_t fixed = vd + (int64_t)D*4;                          /* + final_norm */
         if (!m->lm_tied) fixed += vd;
         fixed += (int64_t)c->n_layers * 8 * D * 4;                  /* norme/vettori: stima larga */
@@ -295,6 +314,7 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
         for (; R < c->n_layers; R++) {
             int64_t lb = layer_f32_bytes(m, R);
             if (m->qbits == 8) lb = lb/4 + lb/64;                   /* int8 + scale */
+            else if (m->qbits == 4) lb = lb/8 + lb/32;              /* int4 + scale di gruppo (gs=32) */
             if (used + lb > budget_bytes) break;
             used += lb;
         }
@@ -466,7 +486,12 @@ static int engine_main(int argc, char **argv) {
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     int qbits = getenv("QBITS") ? atoi(getenv("QBITS")) : 0;
-    if (qbits != 0 && qbits != 8) { fprintf(stderr, "QBITS deve essere 0 (f32) o 8 (int8)\n"); return 1; }
+    if (qbits != 0 && qbits != 4 && qbits != 8) { fprintf(stderr, "QBITS deve essere 0 (f32), 4 (int4) o 8 (int8)\n"); return 1; }
+    if (getenv("QGROUP")) {
+        g_qgroup = atoi(getenv("QGROUP"));
+        if (g_qgroup < 0 || (g_qgroup > 0 && g_qgroup % 16)) {
+            fprintf(stderr, "QGROUP deve essere 0 (scala per riga) o un multiplo di 16\n"); return 1; }
+    }
     int ngen  = getenv("NGEN") ? atoi(getenv("NGEN")) : 256;
     /* MICRO=1: micro-RSS. La KV-cache resta l'unica voce grande -> il default
      * di contesto scende a 256 (CTX esplicito vince sempre). */

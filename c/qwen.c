@@ -8,7 +8,8 @@
  *   NGEN=256 CTX=4096                 limiti di generazione/contesto
  *   TEMP=0.7 NUCLEUS=0.95 SEED=n      sampling (TEMP=0 -> greedy)
  *   CHAT_TEMPLATE=1 THINK=0           template chat Qwen3 (<|im_start|>...); THINK=0 chiude il blocco think
- *   QBITS=8                           quantizza i pesi grandi a int8 al load (~4x meno RAM)
+ *   QBITS=8|4                         quantizza i pesi al load: int8 (~4x meno RAM) o int4
+ *                                     (~8x; embed/lm_head restano int8; QGROUP=32 gruppo scale)
  *   MICRO=1                           micro-RSS: NESSUN peso residente, tutto streamato dal disco
  *                                     (MICRO_DROP=0 per lasciare vivere la page cache)
  *   REF=ref.json                      validazione: greedy sui prompt_ids, confronto con full_ids

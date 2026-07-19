@@ -79,7 +79,8 @@ Common environment variables (qwen engine):
 | `TEMP` / `NUCLEUS` / `SEED` | 0.7 / 0.95 | sampling (TEMP=0 → greedy) |
 | `CHAT_TEMPLATE` | 1 | wrap prompt in the model's chat format |
 | `THINK` | 0 | Qwen3 thinking mode (0 pre-closes the think block) |
-| `QBITS` | 0 | 8 → int8-quantize weights **and embeddings** at load (~4× less RAM); a tied lm_head runs the int8 kernel too |
+| `QBITS` | 0 | 8 → int8-quantize weights **and embeddings** at load (~4× less RAM); 4 → int4 layer weights with group-wise scales (~8× on layers; embeddings and lm_head stay int8 for quality) |
+| `QGROUP` | 32 | int4 scale group size (multiple of 16; 0 → one scale per row). 32 matches the GGUF Q4_0 block |
 | `THREADS` | — | cap the OpenMP team; overrides `OMP_NUM_THREADS`; applied before load |
 | `MEM_GB` | — | RAM budget in GiB: layers beyond the budget stream from disk each step |
 | `MEM_FRAC` | — | same budget as a fraction (0..1) of total physical RAM; `MEM_GB` wins |

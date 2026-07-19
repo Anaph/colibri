@@ -21,7 +21,7 @@
  *   PROMPT="..."                    one-shot; senza PROMPT ne' REF -> chat su stdin
  *   NGEN=256 CTX=4096 TEMP=0.7 NUCLEUS=0.95 SEED=n
  *   CHAT_TEMPLATE=1                 <start_of_turn>user ... <end_of_turn>
- *   QBITS=8                        int8 al load
+ *   QBITS=8|4                      int8/int4 al load (embed/lm_head restano int8 con QBITS=4)
  *   MEM_GB=f / MEM_FRAC=f          budget di residenza (vedi README)
  *   REF=ref.json TOKENS=1          validazione / dump id
  *   GEMMA_NORM_PLAIN=1             RMSNorm con peso "w" invece di "(1+w)" (VERIFY)

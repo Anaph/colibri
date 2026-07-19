@@ -232,6 +232,7 @@ int gm_tiny(void) {
     CHECK(gm_run8(dir, 0, b, 0, 0) == 0);
     for (int i = 0; i < 11; i++) CHECK(a[i]==b[i]);
     CHECK(gm_run8(dir, 8, b, 0, 0) == 0);          /* QBITS=8 */
+    CHECK(gm_run8(dir, 4, b, 0, 0) == 0);          /* QBITS=4: int4 grouped, embed int8 */
     return 0;
 }
 

@@ -528,6 +528,28 @@ int qt_tiny_qbits(void) {
     return qt_run8(dir, 8, 0, q);
 }
 
+/* QBITS=4: layer int4 grouped, embed/lm_head restano int8; deterministico
+ * su dense e ibrido */
+int qt_tiny_qbits4(void) {
+    char dense[512], hyb[512];
+    snprintf(dense, sizeof(dense), "%s", tst_dir("qwen_tiny_model"));
+    snprintf(hyb,   sizeof(hyb),   "%s", tst_dir("qwen_tiny_hybrid"));
+    qt_write_dense_dir(dense);
+    qt_write_hybrid_dir(hyb);
+    int a[16], b[16];
+    CHECK(qt_run8(dense, 4, 0, a) == 0);
+    CHECK(qt_run8(dense, 4, 0, b) == 0);
+    for (int i = 0; i < 11; i++) CHECK(a[i]==b[i]);
+    CHECK(qt_run8(hyb, 4, 1, a) == 0);
+    /* struttura: embed int8, matrici dei layer int4 (gs=QGROUP), testa int8 */
+    Model m; model_init(&m, dense, 4);
+    CHECK(m.embed == NULL && m.embed_q != NULL);
+    CHECK(m.lm_tied && m.lm_head.q == m.embed_q && m.lm_head.q4 == NULL);
+    CHECK(m.L[0].q.q4 != NULL && m.L[0].q.q == NULL && m.L[0].q.f == NULL && m.L[0].q.gs == g_qgroup);
+    CHECK(m.L[0].down.q4 != NULL && m.L[1].up.q4 != NULL);
+    return 0;
+}
+
 int qt_tiny_hybrid(void) {
     const char *dir = tst_dir("qwen_tiny_hybrid");
     qt_write_hybrid_dir(dir);
