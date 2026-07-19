@@ -104,8 +104,8 @@ typedef struct {
 
 /* ---------- config ---------- */
 static void load_cfg(Cfg *c, const char *snap) {
-    char *arena;
-    jval *r = cfg_slurp(snap, &arena);
+    jval *root; char *buf;
+    jval *r = cfg_slurp(snap, &root, &buf);
     if (json_get(r,"enable_moe_block") && json_get(r,"enable_moe_block")->boolean) {
         fprintf(stderr,"gemma: config MoE (enable_moe_block) non supportato da questo motore\n"); exit(1);
     }
@@ -175,6 +175,7 @@ static void load_cfg(Cfg *c, const char *snap) {
     if (c->rot_angles < 1 || c->rot_angles > c->ghd/2) {
         fprintf(stderr,"config: partial_rotary_factor incoerente (rot_angles=%d, ghd=%d)\n", c->rot_angles, c->ghd); exit(1);
     }
+    json_free(root); free(buf);       /* Cfg non trattiene puntatori nel JSON */
 }
 
 /* probe: primo nome esistente tra i candidati; se nessuno, li stampa ed esce.

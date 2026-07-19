@@ -124,8 +124,7 @@ static void st_index_file(shards *S, const char *path) {
     if (pread(fd, hdr, hlen, 8) != (ssize_t)hlen) { perror("pread hdr"); exit(1); }
     hdr[hlen] = 0;
     int64_t data_start = 8 + (int64_t)hlen;
-    char *arena = NULL;
-    jval *root = json_parse(hdr, &arena);
+    jval *root = json_parse(hdr, NULL);
     if (!root || root->t != J_OBJ) {
         fprintf(stderr, "%s: safetensors header is not a JSON object\n", path); exit(1); }
     for (int i = 0; i < root->len; i++) {
@@ -156,7 +155,7 @@ static void st_index_file(shards *S, const char *path) {
         t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
         t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
     }
-    free(arena); /* i jval restano leakati: ok, una tantum all'avvio */
+    json_free(root);   /* i nomi sono gia' strdup'ati nei st_tensor */
     free(hdr);
 }
 

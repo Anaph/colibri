@@ -43,6 +43,23 @@ int ht_json(void) {
     return 0;
 }
 
+/* json_free: albero annidato liberato senza crash, riparsabile dopo (sotto
+ * ASAN in CI questo e' anche l'assert di assenza di leak/double-free) */
+int ht_json_free(void) {
+    const char *doc =
+        "{\"a\":{\"b\":[1,\"x\",{\"c\":null,\"d\":[true,false]}],\"e\":\"\"},"
+        "\"f\":[],\"g\":{},\"h\":\"fine\"}";
+    for (int rep = 0; rep < 3; rep++) {
+        jval *root = json_parse(doc, NULL);
+        CHECK(root && root->t == J_OBJ && root->len == 4);
+        CHECK(json_get(json_get(root,"a"),"b")->len == 3);
+        CHECK(strcmp(json_get(root,"h")->str, "fine") == 0);
+        json_free(root);
+    }
+    json_free(NULL);                        /* deve essere un no-op */
+    return 0;
+}
+
 /* ---------------- st.h ---------------- */
 int ht_st(void) {
     CHECK(bf16_to_f32(0x3f80) == 1.0f);

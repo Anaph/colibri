@@ -374,8 +374,8 @@ static void lora_load(Model *m) {
 
 /* ---------- caricamento config ---------- */
 static void load_cfg(Cfg *c, const char *snap) {
-    char *arena;
-    jval *r = cfg_slurp(snap, &arena);
+    jval *root; char *buf;
+    jval *r = cfg_slurp(snap, &root, &buf);
     cfg_common(r, c);
     jval *th = json_get(r,"rope_theta");   c->theta = th ? (float)th->num : 1000000.f;
     jval *te = json_get(r,"tie_word_embeddings"); c->tie_emb = (te && te->t==J_BOOL) ? te->boolean : 0;
@@ -408,6 +408,7 @@ static void load_cfg(Cfg *c, const char *snap) {
                       c->lin_hv % c->lin_hk || c->lin_conv<1 || c->lin_conv>8)) {
         fprintf(stderr,"config: parametri linear_attention mancanti o incoerenti\n"); exit(1);
     }
+    json_free(root); free(buf);       /* Cfg non trattiene puntatori nel JSON */
 }
 
 /* elenco delle MATRICI di un layer (unica fonte per loader, streamer e

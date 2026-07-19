@@ -4,6 +4,7 @@
 
 extern "C" {
 int ht_json(void);
+int ht_json_free(void);
 int ht_st(void);
 int ht_tok_pairs(void);
 int ht_tok_strings(void);
@@ -21,6 +22,7 @@ int ht_i4_acc512(void);
     TEST(suite, name) { int r = fn(); if (r == 2) GTEST_SKIP(); EXPECT_EQ(0, r); }
 
 C_TEST(Json,        Parse,          ht_json)
+C_TEST(Json,        FreeTree,       ht_json_free)
 C_TEST(Safetensors, Primitives,     ht_st)
 C_TEST(Tok,         MergesPairs,    ht_tok_pairs)
 C_TEST(Tok,         MergesStrings,  ht_tok_strings)

@@ -150,6 +150,18 @@ static jval *json_parse(const char *text, char **arena_out) {
     return v;
 }
 
+/* libera ricorsivamente un albero jval: ogni stringa e ogni nodo hanno la
+ * PROPRIA malloc (j_dup/j_new — il campo arena di jparser e' storico e resta
+ * sempre NULL), quindi il free e' una discesa semplice senza double-free. */
+static void json_free(jval *v) {
+    if (!v) return;
+    free(v->str);
+    for (int i = 0; i < v->len; i++) json_free(v->kids[i]);
+    if (v->keys) { for (int i = 0; i < v->len; i++) free(v->keys[i]); free(v->keys); }
+    free(v->kids);
+    free(v);
+}
+
 static jval *json_get(jval *o, const char *key) {
     if (!o || o->t != J_OBJ) return NULL;
     for (int i = 0; i < o->len; i++) if (strcmp(o->keys[i], key) == 0) return o->kids[i];

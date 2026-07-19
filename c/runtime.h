@@ -52,14 +52,18 @@ static void banner(Model *m);
     fprintf(stderr,"config.json: %s=%ld fuori range [%ld,%ld]\n",name,_v,(long)(lo),(long)(hi)); exit(1);} } while(0)
 
 /* legge e parsa config.json; i rilasci multimodali annidano il config testo
- * sotto text_config. buf/arena restano vivi (one-shot allo startup). */
-static jval *cfg_slurp(const char *snap, char **arena_out) {
+ * sotto text_config. Ritorna l'oggetto config; *root_out e' la RADICE parsata
+ * (puo' differire per il reparent text_config) e *buf_out il testo: il
+ * chiamante li libera con json_free/free a parsing dei campi concluso. */
+static jval *cfg_slurp(const char *snap, jval **root_out, char **buf_out) {
     char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap);
     FILE *f = fopen(path, "rb"); if(!f){perror(path);exit(1);}
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
     char *buf = malloc(n+1); if(fread(buf,1,n,f)!=(size_t)n){} buf[n]=0; fclose(f);
-    jval *r = json_parse(buf, arena_out);
-    jval *tc = json_get(r,"text_config"); if (tc && tc->t==J_OBJ) r = tc;
+    jval *root = json_parse(buf, NULL);
+    jval *r = root;
+    jval *tc = json_get(root,"text_config"); if (tc && tc->t==J_OBJ) r = tc;
+    *root_out = root; *buf_out = buf;
     return r;
 }
 
@@ -341,7 +345,7 @@ static int run_ref(Model *m, const char *refpath) {
     FILE *f = fopen(refpath, "rb"); if(!f){perror(refpath);return 1;}
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
     char *buf=malloc(n+1); if(fread(buf,1,n,f)!=(size_t)n){} buf[n]=0; fclose(f);
-    char *arena=NULL; jval *ref = json_parse(buf, &arena);
+    jval *ref = json_parse(buf, NULL);
     int np, nfull;
     int *prompt = read_int_array(ref,"prompt_ids",&np);
     int *full   = read_int_array(ref,"full_ids",&nfull);
@@ -367,7 +371,7 @@ static int run_ref(Model *m, const char *refpath) {
     printf("\nC engine : "); for (int i=np;i<nfull;i++) { printf("%d ", out[i]); if (out[i]==full[i]) match++; }
     printf("\nMatching tokens: %d/%d\n", match, n_new);
     printf("Speed: %.2f tok/s | PEAK RSS %.2f GB\n", n_new/dt, rss_gb());
-    free(buf); free(arena); free(prompt); free(full); free(out);
+    json_free(ref); free(buf); free(prompt); free(full); free(out);
     return match == n_new ? 0 : 2;
 }
 
