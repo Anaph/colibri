@@ -52,7 +52,21 @@ typedef struct {
     int add_dummy_prefix;     /* normalizer Prepend "▁": prefissa il testo */
     int byte_tok[256];        /* id di "<0xXX>" oppure -1 */
     int16_t *id2byte;         /* [n_ids] inverso di byte_tok (-1 = non byte-token) */
+    /* pool di stringhe: UNA malloc per tutte le chiavi vocab/merges e i
+     * contenuti added (vs ~450k malloc del parse JSON, che viene liberato) */
+    char *pool; int64_t pool_len, pool_off;
 } Tok;
+
+/* bump allocator sul pool (dimensionato esattamente da un passo di sizing:
+ * lo sforamento e' un bug di conteggio, non una condizione di runtime) */
+static char *tk_pool_take(Tok *T, int64_t n){
+    if (T->pool_off + n > T->pool_len) { fprintf(stderr,"[tok] pool overflow (bug di sizing)\n"); exit(1); }
+    char *p = T->pool + T->pool_off; T->pool_off += n; return p;
+}
+static char *tk_pool_dup(Tok *T, const char *s, int n){   /* copia NUL-terminata */
+    char *p = tk_pool_take(T, n + 1);
+    memcpy(p, s, n); p[n] = 0; return p;
+}
 
 /* ---------- UTF-8 ---------- */
 static int u8_next(const unsigned char *s, int len, int i, uint32_t *cp){
@@ -99,7 +113,7 @@ static void tok_load(Tok *T, const char *path){
     memset(T,0,sizeof(*T));
     tk_build_bytemap(T);
     long fn; char *buf=tk_read_file(path,&fn);
-    char *arena=NULL; jval *root=json_parse(buf,&arena);
+    jval *root=json_parse(buf,NULL);
     jval *model=json_get(root,"model");
     jval *vocab=json_get(model,"vocab");
     jval *merges=json_get(model,"merges");
@@ -132,13 +146,34 @@ static void tok_load(Tok *T, const char *path){
     T->id2str=calloc(T->n_ids,sizeof(char*));
     T->id_added=calloc(T->n_ids,sizeof(int));
 
+    /* sizing del pool: stessa aritmetica dei cicli di build qui sotto, cosi'
+     * il bump allocator non puo' sforare. Le chiavi merges sono binarie
+     * "left\0right" senza NUL finale (le hmap usano klen). */
+    int64_t psz=0;
+    for(int i=0;i<vocab->len;i++) psz += (int64_t)strlen(vocab->keys[i]) + 1;
+    for(int i=0;i<merges->len;i++){
+        jval *pr=merges->kids[i];
+        if(pr->t==J_STR){
+            const char *sp=strchr(pr->str,' ');
+            if(!sp){ fprintf(stderr,"tokenizer.json: merge senza spazio: %s\n",pr->str); exit(1); }
+            psz += (int64_t)strlen(pr->str);           /* ll+1+rl: lo spazio diventa NUL */
+        } else {
+            psz += (int64_t)strlen(pr->kids[0]->str) + 1 + strlen(pr->kids[1]->str);
+        }
+    }
+    if(added) for(int i=0;i<added->len;i++) psz += (int64_t)strlen(json_get(added->kids[i],"content")->str) + 1;
+    T->pool_len=psz; T->pool_off=0;
+    T->pool=malloc(psz > 0 ? psz : 1);
+    if(!T->pool){ fprintf(stderr,"[tok] OOM pool %lld\n",(long long)psz); exit(1); }
+
     /* vocab: stringa -> id  (capacita' potenza di 2, ~2-3x) */
     int vc=1; while(vc < vocab->len*2) vc<<=1;
     hm_init(&T->vocab, vc);
     for(int i=0;i<vocab->len;i++){
-        const char *k=vocab->keys[i]; int id=(int)vocab->kids[i]->num;
-        hm_put(&T->vocab, k, (int)strlen(k), id);
-        T->id2str[id]=(char*)k;
+        int kl=(int)strlen(vocab->keys[i]); int id=(int)vocab->kids[i]->num;
+        char *k=tk_pool_dup(T, vocab->keys[i], kl);
+        hm_put(&T->vocab, k, kl, id);
+        T->id2str[id]=k;
     }
     /* merges: "left\0right" -> rank=i
      * Due formati in circolazione: coppie ["left","right"] (GLM) oppure
@@ -147,18 +182,16 @@ static void tok_load(Tok *T, const char *path){
     hm_init(&T->merges, mc);
     for(int i=0;i<merges->len;i++){
         jval *pr=merges->kids[i];
-        const char *l, *r;
+        const char *l, *r; int ll, rl;
         if(pr->t==J_STR){
-            const char *sp=strchr(pr->str,' ');
-            if(!sp){ fprintf(stderr,"tokenizer.json: merge senza spazio: %s\n",pr->str); exit(1); }
-            int ll=(int)(sp-pr->str), rl=(int)strlen(sp+1);
-            char *key=malloc(ll+1+rl); memcpy(key,pr->str,ll); key[ll]=0; memcpy(key+ll+1,sp+1,rl);
-            hm_put(&T->merges, key, ll+1+rl, i);
-            continue;
+            const char *sp=strchr(pr->str,' ');   /* verificato dal sizing */
+            l=pr->str; ll=(int)(sp-pr->str); r=sp+1; rl=(int)strlen(sp+1);
+        } else {
+            l=pr->kids[0]->str; ll=(int)strlen(l);
+            r=pr->kids[1]->str; rl=(int)strlen(r);
         }
-        l=pr->kids[0]->str; r=pr->kids[1]->str;
-        int ll=(int)strlen(l), rl=(int)strlen(r);
-        char *key=malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
+        char *key=tk_pool_take(T, ll+1+rl);
+        memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
         hm_put(&T->merges, key, ll+1+rl, i);
     }
     /* added tokens (speciali e non): atomici, output letterale */
@@ -166,7 +199,8 @@ static void tok_load(Tok *T, const char *path){
         T->nsp=added->len; T->sp=calloc(T->nsp,sizeof(Special));
         for(int i=0;i<added->len;i++){
             jval *a=added->kids[i];
-            char *content=json_get(a,"content")->str; int id=(int)json_get(a,"id")->num;
+            const char *cs=json_get(a,"content")->str; int id=(int)json_get(a,"id")->num;
+            char *content=tk_pool_dup(T, cs, (int)strlen(cs));
             T->sp[i].str=content; T->sp[i].len=(int)strlen(content); T->sp[i].id=id;
             T->id2str[id]=content; T->id_added[id]=1;
         }
@@ -180,8 +214,16 @@ static void tok_load(Tok *T, const char *path){
         T->byte_tok[b]=hm_get(&T->vocab,nm,nl);
         if(T->byte_tok[b]>=0) T->id2byte[T->byte_tok[b]]=(int16_t)b;
     }
-    /* arena/buf restano allocati: le stringhe (j_dup) sono malloc indipendenti e ci servono vive */
-    (void)arena;
+    /* tutte le stringhe vive stanno nel pool: il parse JSON (~450k malloc su
+     * un vocab da 150k) e il testo del file si possono liberare */
+    json_free(root); free(buf);
+}
+
+/* libera tutto lo stato del tokenizer (pool compreso: una free per tutte le stringhe) */
+static void tok_free(Tok *T){
+    free(T->pool); free(T->vocab.e); free(T->merges.e);
+    free(T->id2str); free(T->id_added); free(T->sp); free(T->id2byte);
+    memset(T,0,sizeof(*T));
 }
 
 /* ---------- nucleo BPE: merge greedy per rank su una stringa di simboli.

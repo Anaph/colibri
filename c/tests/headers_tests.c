@@ -111,6 +111,29 @@ static int tok_run_fixture(const char *name, const char *body) {
 int ht_tok_pairs(void)   { return tok_run_fixture("pairs",   TOK_FIX_PAIRS); }
 int ht_tok_strings(void) { return tok_run_fixture("strings", TOK_FIX_STRINGS); }
 
+/* pool di stringhe: dopo tok_load il JSON e' liberato e tutte le stringhe
+ * vivono nel pool; load->uso->tok_free->reload ripetuto non degrada nulla */
+int ht_tok_arena(void) {
+    char path[512];
+    CHECK(tok_write_tmp("arena", TOK_FIX_STRINGS, path, sizeof(path)) == 0);
+    for (int rep = 0; rep < 3; rep++) {
+        Tok T; tok_load(&T, path);
+        CHECK(T.pool != NULL && T.pool_off == T.pool_len);   /* sizing esatto */
+        /* le stringhe vive puntano DENTRO il pool, non nel JSON liberato */
+        CHECK(T.id2str[8] >= T.pool && T.id2str[8] < T.pool + T.pool_len);
+        CHECK(T.sp[0].str >= T.pool && T.sp[0].str < T.pool + T.pool_len);
+        int ids[64]; int n = tok_encode(&T, "hello<|endoftext|>hello", 23, ids, 64);
+        CHECK(n == 3 && ids[0] == 8 && ids[1] == 9 && ids[2] == 8);
+        char dec[64]; int dn = tok_decode(&T, ids, 1, dec, 63);
+        CHECK(dn == 5 && !memcmp(dec, "hello", 5));
+        CHECK(tok_id_of(&T, "<|endoftext|>") == 9);
+        tok_free(&T);
+        CHECK(T.pool == NULL && T.vocab.e == NULL);
+    }
+    remove(path);
+    return 0;
+}
+
 /* ---- modalita' sentencepiece (Gemma): metaspazio + byte-fallback ---- */
 static const char *TOK_FIX_SP =
   "{\"model\":{\"type\":\"BPE\",\"byte_fallback\":true,"
