@@ -324,6 +324,42 @@ static void gguf_repack_q4_0(const uint8_t *blocks, uint8_t *q4, float *qs, int6
     }
 }
 
+/* ---------- config sintetico ----------
+ * Emette una stringa JSON con le chiavi HF a partire dai metadati <arch>.*:
+ * cfg_slurp la parsa al posto di config.json, cosi' load_cfg dei motori resta
+ * byte-identico (CKR compresi). vocab_size = lunghezza dell'array tokens. */
+static char *gguf_synth_config(GgufMeta *M) {
+    const char *a = M->arch[0] ? M->arch : "qwen3";
+    char k[160];
+    #define GKI(nm, def) (snprintf(k, sizeof(k), "%s." nm, a), gguf_int(M, k, def))
+    #define GKF(nm, def) (snprintf(k, sizeof(k), "%s." nm, a), gguf_float(M, k, def))
+    int64_t D   = GKI("embedding_length", 0);
+    int64_t L   = GKI("block_count", 0);
+    int64_t H   = GKI("attention.head_count", 0);
+    int64_t KV  = GKI("attention.head_count_kv", H);
+    int64_t IN  = GKI("feed_forward_length", 0);
+    int64_t ctx = GKI("context_length", 32768);
+    int64_t hd  = GKI("attention.key_length", 0);
+    double th   = GKF("rope.freq_base", 1000000.0);
+    double eps  = GKF("attention.layer_norm_rms_epsilon", 1e-6);
+    #undef GKI
+    #undef GKF
+    gkv *tk = gguf_find(M, "tokenizer.ggml.tokens");
+    int64_t vocab = (tk && tk->v.t == GG_ARR) ? tk->v.an : 0;
+    int64_t eos = gguf_int(M, "tokenizer.ggml.eos_token_id", -1);
+    char *buf = malloc(1024);
+    int n = snprintf(buf, 1024,
+        "{\"hidden_size\":%lld,\"num_hidden_layers\":%lld,\"num_attention_heads\":%lld,"
+        "\"num_key_value_heads\":%lld,\"intermediate_size\":%lld,\"vocab_size\":%lld,"
+        "\"max_position_embeddings\":%lld,\"rope_theta\":%.9g,\"rms_norm_eps\":%.9g",
+        (long long)D, (long long)L, (long long)H, (long long)KV, (long long)IN,
+        (long long)vocab, (long long)ctx, th, eps);
+    if (hd > 0)   n += snprintf(buf+n, 1024-n, ",\"head_dim\":%lld", (long long)hd);
+    if (eos >= 0) n += snprintf(buf+n, 1024-n, ",\"eos_token_id\":%lld", (long long)eos);
+    snprintf(buf+n, 1024-n, "}");
+    return buf;
+}
+
 /* ---------- indicizzazione di un file GGUF dentro shards ---------- */
 static void gguf_index(shards *S, GgufMeta *M, const char *path) {
     memset(S, 0, sizeof(*S));
@@ -401,9 +437,9 @@ static void gguf_index(shards *S, GgufMeta *M, const char *path) {
                 fprintf(stderr, "%s: tipo ggml %u non supportato (tensore %.*s)\n",
                         path, gt, (int)nl, nm); exit(1); }
             int64_t nbytes;
-            int be, bb;
+            int be = 1, bb = 1;
             if (dt >= ST_DTYPE_QBLOCK) {
-                st_qblock(dt, &be, &bb);
+                st_qblock(dt, &be, &bb);   /* dt filtrato da gguf_ggml_dtype: sempre noto */
                 if (numel % be) { fprintf(stderr, "%s: numel %lld non multiplo del blocco %d\n",
                                           path, (long long)numel, be); exit(1); }
                 nbytes = numel/be*bb;

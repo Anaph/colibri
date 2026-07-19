@@ -35,6 +35,7 @@
 #include <time.h>
 #include "nn.h"
 #include "st.h"
+#include "gguf.h"
 #include "tok.h"
 
 #define ENGINE_TAG "gemma"

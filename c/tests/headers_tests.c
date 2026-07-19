@@ -255,6 +255,46 @@ static int tok_run_fixture(const char *name, const char *body) {
 int ht_tok_pairs(void)   { return tok_run_fixture("pairs",   TOK_FIX_PAIRS); }
 int ht_tok_strings(void) { return tok_run_fixture("strings", TOK_FIX_STRINGS); }
 
+/* tokenizer dai metadati GGUF == tokenizer.json equivalente (stessi id) */
+int ht_tok_gguf(void) {
+    char gpath[512]; ht_gguf_tmp("tok", gpath, sizeof(gpath));
+    tg_reset();
+    tg_kv_str("tokenizer.ggml.model", "gpt2");
+    /* stesso vocabolario di TOK_FIX_STRINGS: id = indice; "Ġ" = C4 A0 */
+    static const char *toks[10] = { "h","e","l","o","\xC4\xA0","he","ll","hell","hello","<|endoftext|>" };
+    tg_kv_arr_str("tokenizer.ggml.tokens", toks, 10);
+    static const int32_t types[10] = { 1,1,1,1,1,1,1,1,1,3 };   /* 3 = CONTROL -> added */
+    tg_kv_arr_i32("tokenizer.ggml.token_type", types, 10);
+    static const char *mrg[4] = { "h e", "l l", "he ll", "hell o" };
+    tg_kv_arr_str("tokenizer.ggml.merges", mrg, 4);
+    tg_write(gpath);
+    shards S; GgufMeta M;
+    gguf_index(&S, &M, gpath);
+    Tok G; tok_load_gguf(&G, &M);
+    CHECK(G.n_ids == 10 && G.nsp == 1 && G.sp[0].id == 9);
+    CHECK(G.pool_off == G.pool_len);                       /* sizing esatto */
+    /* riferimento: la stessa fixture via tokenizer.json */
+    char jpath[512];
+    CHECK(tok_write_tmp("gguf_ref", TOK_FIX_STRINGS, jpath, sizeof(jpath)) == 0);
+    Tok J; tok_load(&J, jpath);
+    const char *cases[3] = { "hello", "hello<|endoftext|>hello", "hell hello" };
+    for (int cse = 0; cse < 3; cse++) {
+        int ig[64], ij[64];
+        int ng = tok_encode(&G, cases[cse], (int)strlen(cases[cse]), ig, 64);
+        int nj = tok_encode(&J, cases[cse], (int)strlen(cases[cse]), ij, 64);
+        CHECK(ng == nj && memcmp(ig, ij, ng*sizeof(int)) == 0);
+        char dg[64], dj[64];
+        int lg = tok_decode(&G, ig, ng, dg, 63);
+        int lj = tok_decode(&J, ij, nj, dj, 63);
+        CHECK(lg == lj && memcmp(dg, dj, lg) == 0);
+    }
+    CHECK(tok_id_of(&G, "<|endoftext|>") == 9);
+    tok_free(&G); tok_free(&J);
+    g_st_dequant_fn = NULL;
+    remove(gpath); remove(jpath);
+    return 0;
+}
+
 /* pool di stringhe: dopo tok_load il JSON e' liberato e tutte le stringhe
  * vivono nel pool; load->uso->tok_free->reload ripetuto non degrada nulla */
 int ht_tok_arena(void) {

@@ -12,6 +12,7 @@ int ht_gguf_kquants(void);
 int ht_tok_pairs(void);
 int ht_tok_strings(void);
 int ht_tok_arena(void);
+int ht_tok_gguf(void);
 int ht_tok_sp(void);
 int ht_tok_sp_detect(void);
 int ht_tier(void);
@@ -34,6 +35,7 @@ C_TEST(Gguf,        KQuants,        ht_gguf_kquants)
 C_TEST(Tok,         MergesPairs,    ht_tok_pairs)
 C_TEST(Tok,         MergesStrings,  ht_tok_strings)
 C_TEST(Tok,         StringPool,     ht_tok_arena)
+C_TEST(Tok,         FromGguf,       ht_tok_gguf)
 C_TEST(Tok,         SentencePiece,  ht_tok_sp)
 C_TEST(Tok,         SpDetection,    ht_tok_sp_detect)
 C_TEST(Tier,        SwapDecayLfru,  ht_tier)

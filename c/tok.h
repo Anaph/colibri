@@ -226,6 +226,81 @@ static void tok_free(Tok *T){
     memset(T,0,sizeof(*T));
 }
 
+#ifdef GGUF_H
+/* carica il tokenizer dai metadati GGUF (tokenizer.ggml.*): stesso Tok di
+ * tok_load, stringhe nel pool. Modello atteso "gpt2" (byte-level BPE, la
+ * famiglia Qwen); i tokenizer sentencepiece in GGUF non sono supportati.
+ * In GGUF l'id di un token E' il suo indice nell'array tokens. */
+static void tok_load_gguf(Tok *T, GgufMeta *M) {
+    memset(T, 0, sizeof(*T));
+    tk_build_bytemap(T);
+    int64_t ml; const char *mdl = gguf_str(M, "tokenizer.ggml.model", &ml);
+    if (!mdl || ml != 4 || memcmp(mdl, "gpt2", 4)) {
+        fprintf(stderr, "[tok] GGUF: tokenizer.ggml.model non 'gpt2' (solo byte-level BPE)\n"); exit(1);
+    }
+    T->mode = 0;
+    garr toks, types, mrg;
+    if (!gguf_arr(M, "tokenizer.ggml.tokens", &toks)) {
+        fprintf(stderr, "[tok] GGUF: manca tokenizer.ggml.tokens\n"); exit(1); }
+    int64_t nvoc = toks.left;
+    int have_types  = gguf_arr(M, "tokenizer.ggml.token_type", &types);
+    int have_merges = gguf_arr(M, "tokenizer.ggml.merges", &mrg);
+    int64_t nmerg = have_merges ? mrg.left : 0;
+    /* sizing del pool: token (+NUL) e chiavi merges ("left\0right" = len) */
+    int64_t psz = 0, l;
+    garr it = toks; while (garr_next_str(&it, &l)) psz += l + 1;
+    if (have_merges) { it = mrg; while (garr_next_str(&it, &l)) psz += l; }
+    T->pool_len = psz; T->pool_off = 0;
+    T->pool = malloc(psz > 0 ? psz : 1);
+    if (!T->pool) { fprintf(stderr, "[tok] OOM pool %lld\n", (long long)psz); exit(1); }
+    T->n_ids = (int)nvoc;
+    T->id2str = calloc(T->n_ids, sizeof(char*));
+    T->id_added = calloc(T->n_ids, sizeof(int));
+    int vc = 1; while (vc < nvoc*2) vc <<= 1;
+    hm_init(&T->vocab, vc);
+    int nsp = 0;
+    for (int64_t id = 0; id < nvoc; id++) {
+        const char *s = garr_next_str(&toks, &l);
+        if (!s) { fprintf(stderr, "[tok] GGUF: array tokens troncato\n"); exit(1); }
+        char *k = tk_pool_dup(T, s, (int)l);
+        hm_put(&T->vocab, k, (int)l, (int)id);
+        T->id2str[id] = k;
+        int tt = have_types ? (int)garr_next_int(&types) : 1;
+        if (tt == 3) { T->id_added[id] = 1; nsp++; }   /* CONTROL -> added token */
+    }
+    int mc = 1; while (mc < (nmerg > 0 ? nmerg : 1)*2) mc <<= 1;
+    hm_init(&T->merges, mc);
+    if (have_merges) for (int64_t i = 0; i < nmerg; i++) {
+        const char *s = garr_next_str(&mrg, &l);
+        const char *sp = s ? memchr(s, ' ', l) : NULL;
+        if (!sp) { fprintf(stderr, "[tok] GGUF: merge senza spazio\n"); exit(1); }
+        int ll = (int)(sp - s), rl = (int)(l - ll - 1);
+        char *key = tk_pool_take(T, ll + 1 + rl);
+        memcpy(key, s, ll); key[ll] = 0; memcpy(key+ll+1, sp+1, rl);
+        hm_put(&T->merges, key, ll+1+rl, (int)i);
+    }
+    /* added token (CONTROL), ordinati per lunghezza decrescente */
+    T->nsp = nsp; T->sp = calloc(nsp > 0 ? nsp : 1, sizeof(Special));
+    int si = 0;
+    for (int id = 0; id < T->n_ids; id++)
+        if (T->id_added[id]) {
+            T->sp[si].str = T->id2str[id];
+            T->sp[si].len = (int)strlen(T->id2str[id]);
+            T->sp[si].id = id; si++;
+        }
+    qsort(T->sp, T->nsp, sizeof(Special), cmp_sp_len);
+    T->id2byte = malloc(T->n_ids * sizeof(int16_t));
+    for (int i = 0; i < T->n_ids; i++) T->id2byte[i] = -1;
+    for (int b = 0; b < 256; b++) {
+        char nm[8]; int nl = snprintf(nm, sizeof(nm), "<0x%02X>", b);
+        T->byte_tok[b] = hm_get(&T->vocab, nm, nl);
+        if (T->byte_tok[b] >= 0) T->id2byte[T->byte_tok[b]] = (int16_t)b;
+    }
+    fprintf(stderr, "[tok] GGUF: %d token, %lld merges, %d added\n",
+            T->n_ids, (long long)nmerg, T->nsp);
+}
+#endif /* GGUF_H */
+
 /* ---------- nucleo BPE: merge greedy per rank su una stringa di simboli.
  * sp_fallback=0 (byte-level): simboli fuori vocab vengono scartati.
  * sp_fallback=1 (sentencepiece): ogni byte grezzo del simbolo -> <0xXX>. */

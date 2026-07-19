@@ -4,6 +4,7 @@
 #define QWEN_TEST
 #include "../qwen.c"
 #include "tiny_st.h"
+#include "tiny_gguf.h"
 
 #define CHECK(cond) do { if (!(cond)) { \
     fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #cond); return 1; } } while (0)
@@ -703,6 +704,121 @@ int qt_micro_parity(void) {
         CHECK(qt_run8_micro(dirs[d], b) == 0);
         for (int i = 0; i < 11; i++) CHECK(a[i] == b[i]);
     }
+    return 0;
+}
+
+/* ---- GGUF: stesso modello via safetensors e via GGUF -> logits bit-esatti ---- */
+int qt_gguf_tiny_parity(void) {
+    char dense[512]; snprintf(dense, sizeof(dense), "%s", tst_dir("qwen_tiny_model"));
+    qt_write_dense_dir(dense);
+    /* riscrivi i tensori del safetensors in un GGUF con i nomi llama.cpp:
+     * dati bit-identici per costruzione */
+    shards S; st_init(&S, dense);
+    tg_reset();
+    tg_kv_str("general.architecture", "qwen3");
+    tg_kv_u32("qwen3.embedding_length", 16);
+    tg_kv_u32("qwen3.block_count", 2);
+    tg_kv_u32("qwen3.attention.head_count", 4);
+    tg_kv_u32("qwen3.attention.head_count_kv", 2);
+    tg_kv_u32("qwen3.attention.key_length", 8);
+    tg_kv_u32("qwen3.feed_forward_length", 32);
+    tg_kv_u32("qwen3.context_length", 64);
+    tg_kv_f32("qwen3.rope.freq_base", 1000000.0f);
+    tg_kv_f32("qwen3.attention.layer_norm_rms_epsilon", 1e-6f);
+    tg_kv_u32("tokenizer.ggml.eos_token_id", 0);
+    const char *toks[32]; char tbuf[32][8];              /* vocab_size = len(tokens) */
+    for (int i = 0; i < 32; i++) { snprintf(tbuf[i], 8, "t%d", i); toks[i] = tbuf[i]; }
+    tg_kv_arr_str("tokenizer.ggml.tokens", toks, 32);
+    static const struct { const char *st, *gg; } map[] = {
+        { "model.embed_tokens.weight", "token_embd.weight" },
+        { "model.norm.weight",         "output_norm.weight" },
+        { "model.layers.%d.input_layernorm.weight",          "blk.%d.attn_norm.weight" },
+        { "model.layers.%d.post_attention_layernorm.weight", "blk.%d.ffn_norm.weight" },
+        { "model.layers.%d.self_attn.q_norm.weight",         "blk.%d.attn_q_norm.weight" },
+        { "model.layers.%d.self_attn.k_norm.weight",         "blk.%d.attn_k_norm.weight" },
+        { "model.layers.%d.self_attn.q_proj.weight",         "blk.%d.attn_q.weight" },
+        { "model.layers.%d.self_attn.k_proj.weight",         "blk.%d.attn_k.weight" },
+        { "model.layers.%d.self_attn.v_proj.weight",         "blk.%d.attn_v.weight" },
+        { "model.layers.%d.self_attn.o_proj.weight",         "blk.%d.attn_output.weight" },
+        { "model.layers.%d.mlp.gate_proj.weight",            "blk.%d.ffn_gate.weight" },
+        { "model.layers.%d.mlp.up_proj.weight",              "blk.%d.ffn_up.weight" },
+        { "model.layers.%d.mlp.down_proj.weight",            "blk.%d.ffn_down.weight" },
+    };
+    static float tdata[32*16];
+    for (size_t e = 0; e < sizeof map/sizeof map[0]; e++) {
+        for (int li = 0; li < (e < 2 ? 1 : 2); li++) {
+            char sn[128], gn[128];
+            snprintf(sn, sizeof(sn), map[e].st, li);
+            snprintf(gn, sizeof(gn), map[e].gg, li);
+            int64_t n = st_numel(&S, sn);
+            CHECK(n > 0 && n <= 32*16);
+            st_read_f32(&S, sn, tdata, 0);
+            tg_tensor_f32(gn, 1, n, tdata);              /* i motori validano solo il numel */
+        }
+    }
+    const char *tmp = getenv("TMPDIR"); if (!tmp) tmp = "/tmp";
+    char gpath[600]; snprintf(gpath, sizeof(gpath), "%s/qwen_tiny.gguf", tmp);
+    tg_write(gpath);
+    /* run A: snapshot HF; run B: GGUF single-file */
+    static const int prompt[3] = {1,2,3};
+    Model a; model_init(&a, dense, 0);
+    kv_alloc(&a, 16);
+    float *la = step(&a, prompt, 3, 0);
+    g_gguf = gpath;
+    Model b; model_init(&b, NULL, 0);
+    g_gguf = NULL;
+    CHECK(b.c.hidden == 16 && b.c.n_layers == 2 && b.c.head_dim == 8 && b.c.vocab == 32);
+    CHECK(b.lm_tied);                                    /* niente output.weight nel GGUF */
+    kv_alloc(&b, 16);
+    float *lb = step(&b, prompt, 3, 0);
+    CHECK(memcmp(la, lb, a.c.vocab*sizeof(float)) == 0);
+    free(la); free(lb);
+    g_st_dequant_fn = NULL;
+    remove(gpath);
+    return 0;
+}
+
+/* ---- GGUF Q4_0: fast-path repack lossless in load_mat_bits + dequant f32 ---- */
+int qt_gguf_q4_0_load(void) {
+    enum { O = 4, I = 64, NB = I/32 };
+    /* blocchi Q4_0 costruiti a mano: scala f16 nota + nibble pseudo-casuali */
+    uint8_t blocks[O*NB*18];
+    static const uint16_t ds[2] = { 0x3C00, 0x3800 };    /* 1.0, 0.5 */
+    qt_rng_s = 4242;
+    for (int b = 0; b < O*NB; b++) {
+        memcpy(blocks + b*18, &ds[b & 1], 2);
+        for (int i = 0; i < 16; i++) {
+            qt_rng_s ^= qt_rng_s<<13; qt_rng_s ^= qt_rng_s>>7; qt_rng_s ^= qt_rng_s<<17;
+            blocks[b*18 + 2 + i] = (uint8_t)(qt_rng_s & 0xFF);
+        }
+    }
+    tg_reset();
+    tg_kv_str("general.architecture", "qwen3");
+    int64_t dims[2] = { I, O };
+    tg_tensor("blk.0.ffn_gate.weight", 2 /* GGML Q4_0 */, 2, dims, blocks, sizeof(blocks));
+    const char *tmp = getenv("TMPDIR"); if (!tmp) tmp = "/tmp";
+    char gpath[600]; snprintf(gpath, sizeof(gpath), "%s/qwen_q40.gguf", tmp);
+    tg_write(gpath);
+    Model m; memset(&m, 0, sizeof m);
+    GgufMeta meta;
+    gguf_index(&m.S, &meta, gpath);
+    CHECK(st_dtype(&m.S, "model.layers.0.mlp.gate_proj.weight") == ST_Q4_0);
+    /* QBITS=4: repack lossless, bit-identico al repack di riferimento */
+    Mat w;
+    load_mat_bits(&m, &w, "model.layers.0.mlp.gate_proj.weight", O, I, 4);
+    CHECK(w.q4 != NULL && w.gs == 32 && w.f == NULL && w.q == NULL);
+    uint8_t rq4[O*I/2]; float rqs[O*NB];
+    gguf_repack_q4_0(blocks, rq4, rqs, O, I);
+    CHECK(memcmp(w.q4, rq4, sizeof(rq4)) == 0);
+    CHECK(memcmp(w.qs, rqs, sizeof(rqs)) == 0);
+    /* QBITS=0: percorso dequant f32 via hook, uguale a gguf_dq_q4_0 */
+    Mat wf;
+    load_mat_bits(&m, &wf, "model.layers.0.mlp.gate_proj.weight", O, I, 0);
+    float ref[O*I];
+    gguf_dq_q4_0(blocks, O*NB, ref);
+    CHECK(wf.f != NULL && memcmp(wf.f, ref, sizeof(ref)) == 0);
+    g_st_dequant_fn = NULL;
+    remove(gpath);
     return 0;
 }
 

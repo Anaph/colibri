@@ -3,7 +3,9 @@
  * Tutti i pesi residenti in RAM (f32, oppure int8 con QBITS=8).
  *
  * Uso (variabili d'ambiente, stile glm/olmoe):
- *   SNAP=<dir snapshot HF>            obbligatoria (config.json + tokenizer.json + *.safetensors)
+ *   SNAP=<dir snapshot HF>            config.json + tokenizer.json + *.safetensors
+ *   GGUF=<file.gguf>                  in alternativa a SNAP: modello single-file (pesi, config
+ *                                     e tokenizer dai metadati; F32/F16/BF16/Q8_0/Q4_0/Q4-6_K)
  *   PROMPT="..."                      one-shot; senza PROMPT ne' REF -> chat interattiva su stdin
  *   NGEN=256 CTX=4096                 limiti di generazione/contesto
  *   TEMP=0.7 NUCLEUS=0.95 SEED=n      sampling (TEMP=0 -> greedy)
@@ -23,6 +25,7 @@
 #include <time.h>
 #include "nn.h"
 #include "st.h"
+#include "gguf.h"
 #include "stw.h"
 #include "tok.h"
 

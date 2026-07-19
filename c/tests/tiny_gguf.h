@@ -20,7 +20,7 @@ typedef struct {
     uint8_t *adata; size_t abytes;   /* array gia' serializzato (posseduto) */
 } tg_kv_rec;
 typedef struct {
-    char name[96];
+    char name[160];
     uint32_t gt; int nd; int64_t dims[4];
     uint8_t *data; size_t nbytes;    /* copia posseduta */
 } tg_t_rec;

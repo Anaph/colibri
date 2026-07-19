@@ -47,6 +47,13 @@ static void banner(Model *m);
 #define ENGINE_MICRO 0
 #endif
 
+/* ---------- sorgente GGUF (GGUF=<file> al posto di SNAP=<dir>) ----------
+ * gguf_index riempie lo stesso indice shards con nomi HF: da qui in poi il
+ * runtime non distingue le due sorgenti, salvo config (sintetico dai
+ * metadati) e tokenizer (tokenizer.ggml.*). */
+static const char *g_gguf = NULL;
+static GgufMeta g_gguf_meta;
+
 /* ---------- config: range check ---------- */
 #define CKR(name, v, lo, hi) do { long _v=(long)(v); if(_v<(lo)||_v>(hi)){ \
     fprintf(stderr,"config.json: %s=%ld fuori range [%ld,%ld]\n",name,_v,(long)(lo),(long)(hi)); exit(1);} } while(0)
@@ -56,10 +63,15 @@ static void banner(Model *m);
  * (puo' differire per il reparent text_config) e *buf_out il testo: il
  * chiamante li libera con json_free/free a parsing dei campi concluso. */
 static jval *cfg_slurp(const char *snap, jval **root_out, char **buf_out) {
-    char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap);
-    FILE *f = fopen(path, "rb"); if(!f){perror(path);exit(1);}
-    fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
-    char *buf = malloc(n+1); if(fread(buf,1,n,f)!=(size_t)n){} buf[n]=0; fclose(f);
+    char *buf;
+    if (g_gguf) {
+        buf = gguf_synth_config(&g_gguf_meta);      /* metadati -> JSON con chiavi HF */
+    } else {
+        char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap);
+        FILE *f = fopen(path, "rb"); if(!f){perror(path);exit(1);}
+        fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
+        buf = malloc(n+1); if(fread(buf,1,n,f)!=(size_t)n){} buf[n]=0; fclose(f);
+    }
     jval *root = json_parse(buf, NULL);
     jval *r = root;
     jval *tc = json_get(root,"text_config"); if (tc && tc->t==J_OBJ) r = tc;
@@ -117,6 +129,25 @@ static int g_qgroup = 32;
 static void load_mat_bits(Model *m, Mat *w, const char *name, int O, int I, int bits) {
     w->O = O; w->I = I; w->q = NULL; w->qs = NULL; w->sh = NULL; w->sname = NULL;
     w->q4 = NULL; w->gs = 0;
+    /* GGUF Q4_0 + QBITS=4 con gruppo 32: repack LOSSLESS (pura permutazione
+     * di nibble, gguf.h) invece di dequant+requant — stessi bit del file */
+    if (bits == 4 && g_qgroup == 32 && I % 32 == 0 && st_dtype(&m->S, name) == ST_Q4_0) {
+        st_tensor *t = st_find(&m->S, name);
+        if (t->numel != (int64_t)O*I) {
+            fprintf(stderr, "tensor %s: numel %lld != atteso %lld\n",
+                    name, (long long)t->numel, (long long)((int64_t)O*I));
+            exit(1);
+        }
+        void *raw = malloc(t->nbytes);
+        if (!raw) { fprintf(stderr, "OOM raw %s\n", name); exit(1); }
+        st_read_raw(&m->S, name, raw, 0);
+        w->q4 = malloc((int64_t)O*(I/2)); w->qs = falloc((int64_t)O*(I/32));
+        if (!w->q4) { fprintf(stderr, "OOM quant %s\n", name); exit(1); }
+        gguf_repack_q4_0(raw, w->q4, w->qs, O, I);
+        free(raw);
+        w->gs = 32;
+        return;
+    }
     w->f = load_t(m, name, (int64_t)O*I);
     if (bits == 8) {
         w->q = malloc((int64_t)O*I); w->qs = falloc(O);
@@ -280,8 +311,10 @@ static void mat_stream_init(Model *m, Mat *w, const char *name, int O, int I) {
 static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_bytes, int ctx_hint) {
     memset(m, 0, sizeof(*m));
     m->qbits = qbits;
+    /* GGUF: l'indice va costruito PRIMA del config (i metadati SONO il config) */
+    if (g_gguf) gguf_index(&m->S, &g_gguf_meta, g_gguf);
     load_cfg(&m->c, snap);
-    st_init(&m->S, snap);
+    if (!g_gguf) st_init(&m->S, snap);
     Cfg *c = &m->c;
     double t0 = now_s();
     int D = c->hidden;
@@ -563,7 +596,9 @@ static int engine_main(int argc, char **argv) {
     const char *th_ = getenv("THREADS");
     if (th_ && atoi(th_) > 0) omp_set_num_threads(atoi(th_));
     const char *snap = getenv("SNAP");
-    if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
+    g_gguf = getenv("GGUF");
+    if (g_gguf && !*g_gguf) g_gguf = NULL;
+    if (!snap && !g_gguf) { fprintf(stderr, "set SNAP=<snapshot directory> oppure GGUF=<file.gguf>\n"); return 1; }
     int qbits = getenv("QBITS") ? atoi(getenv("QBITS")) : 0;
     if (qbits != 0 && qbits != 4 && qbits != 8) { fprintf(stderr, "QBITS deve essere 0 (f32), 4 (int4) o 8 (int8)\n"); return 1; }
     if (getenv("QGROUP")) {
@@ -600,8 +635,12 @@ static int engine_main(int argc, char **argv) {
     const char *refpath = getenv("REF");
     if (refpath) return run_ref(&m, refpath);
 
-    char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
-    Tok T; tok_load(&T, tokpath);
+    Tok T;
+    if (g_gguf) tok_load_gguf(&T, &g_gguf_meta);   /* single-file: vocab/merges dai metadati */
+    else {
+        char tokpath[2048]; snprintf(tokpath, sizeof(tokpath), "%s/tokenizer.json", snap);
+        tok_load(&T, tokpath);
+    }
     stops_seed(&m, &T);
     for (int i = 0; i < m.c.n_eos; i++) stop_add(m.c.eos[i]);
     fprintf(stderr, "[" ENGINE_TAG "] stop tokens:"); for (int i=0;i<g_nstop;i++) fprintf(stderr," %d",g_stop[i]); fprintf(stderr,"\n");
