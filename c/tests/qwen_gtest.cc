@@ -21,6 +21,9 @@ int qt_tiny_hybrid(void);
 int qt_memknob_parity(void);
 int qt_memknob_env(void);
 int qt_memknob_q8_parity(void);
+int qt_kv_i8_roundtrip(void);
+int qt_kv_i8_tolerance(void);
+int qt_kv_i8_hybrid(void);
 int qt_prefill_chunk(void);
 int qt_prefill_chunk_tta(void);
 int qt_micro_parity(void);
@@ -65,6 +68,9 @@ C_TEST(QwenTiny,     HybridDeterministic, qt_tiny_hybrid)
 C_TEST(QwenMemKnob,  StreamTokenParity,   qt_memknob_parity)
 C_TEST(QwenMemKnob,  EnvPrecedence,       qt_memknob_env)
 C_TEST(QwenMemKnob,  StreamInt8Parity,    qt_memknob_q8_parity)
+C_TEST(QwenKv8,      RowRoundtrip,        qt_kv_i8_roundtrip)
+C_TEST(QwenKv8,      LogitsTolerance,     qt_kv_i8_tolerance)
+C_TEST(QwenKv8,      HybridLayout,        qt_kv_i8_hybrid)
 C_TEST(QwenPrefill,  ChunkBitExact,       qt_prefill_chunk)
 C_TEST(QwenPrefill,  ChunkTtaStash,       qt_prefill_chunk_tta)
 C_TEST(QwenMicro,    StreamBitExact,      qt_micro_parity)

@@ -86,8 +86,11 @@ typedef struct {
     Mat lm_head; int lm_tied;
     Lora lm_lora;                          /* adattatore LoRA sull'lm_head (r=0 = spento) */
     Layer *L;
-    /* kv-cache per-layer: K,V come [n_kv_heads * max_t * head_dim] */
+    /* kv-cache per-layer: K,V come [n_kv_heads * max_t * head_dim].
+     * Con KV_BITS=8 al posto di K/V vivono K8/V8 (int8) + Ks/Vs (scala per
+     * (testa_kv, posizione), indice [hh*max_t + t]). */
     float **K, **V; int kv_len, max_t;
+    int8_t **K8, **V8; float **Ks, **Vs;
     float *att_sc;              /* scratch punteggi attention: [n_thread][max_t] */
     /* streaming a budget (MEM_GB/MEM_FRAC): i primi n_resident layer stanno in
      * RAM, gli altri vengono riletti dal disco a ogni step in stream_buf */
@@ -478,7 +481,9 @@ static void load_small(Model *m) {
 static int64_t fixed_bytes(Model *m, int ctx) {
     Cfg *c = &m->c;
     int nfull = 0; for (int i = 0; i < c->n_layers; i++) if (c->ltype[i] == LT_FULL) nfull++;
-    return (int64_t)nfull * 2 * c->n_kv_heads * ctx * c->head_dim * 4;
+    int64_t rows = (int64_t)nfull * 2 * c->n_kv_heads * ctx;
+    return g_kv_bits == 8 ? rows*c->head_dim + rows*4      /* int8 + scala per riga */
+                          : rows*c->head_dim*4;
 }
 
 /* azzera gli stati ricorrenti dei layer lineari (inizio generazione / reset
@@ -557,10 +562,17 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         }
     }
     /* scrive k,v nella kv-cache alle posizioni pos_base..pos_base+S-1 */
+    int kv8 = m->K8[layer] != NULL;           /* KV_BITS=8 su questo layer */
     for (int s = 0; s < S; s++) for (int hh = 0; hh < KV; hh++) {
         int t = pos_base + s;
-        memcpy(m->K[layer] + ((int64_t)hh*m->max_t + t)*hd, k + s*kw + (int64_t)hh*hd, hd*sizeof(float));
-        memcpy(m->V[layer] + ((int64_t)hh*m->max_t + t)*hd, vv + s*kw + (int64_t)hh*hd, hd*sizeof(float));
+        int64_t slot = (int64_t)hh*m->max_t + t;
+        if (kv8) {
+            kv_store_row(m->K8[layer] + slot*hd, &m->Ks[layer][slot], k + s*kw + (int64_t)hh*hd, hd);
+            kv_store_row(m->V8[layer] + slot*hd, &m->Vs[layer][slot], vv + s*kw + (int64_t)hh*hd, hd);
+        } else {
+            memcpy(m->K[layer] + slot*hd, k + s*kw + (int64_t)hh*hd, hd*sizeof(float));
+            memcpy(m->V[layer] + slot*hd, vv + s*kw + (int64_t)hh*hd, hd*sizeof(float));
+        }
     }
     float scale = 1.f / sqrtf((float)hd);
     float *ctx = falloc(S*qw);
@@ -573,17 +585,36 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             int kvh = hh / G;                 /* GQA: testa kv condivisa */
             int qpos = pos_base + s;
             const float *qv = q + s*qw + (int64_t)hh*hd;
-            for (int t = 0; t <= qpos; t++) {
-                const float *kr = m->K[layer] + ((int64_t)kvh*m->max_t + t)*hd;
-                sc[t] = dot_f32(qv, kr, hd) * scale;
+            if (kv8) {
+                /* q resta f32 (errore di quantizzazione UNILATERALE, solo su K) */
+                const int8_t *K8c = m->K8[layer]; const float *Ksc = m->Ks[layer];
+                for (int t = 0; t <= qpos; t++) {
+                    int64_t slot = (int64_t)kvh*m->max_t + t;
+                    sc[t] = Ksc[slot] * dot_f32i8(qv, K8c + slot*hd, hd) * scale;
+                }
+            } else {
+                for (int t = 0; t <= qpos; t++) {
+                    const float *kr = m->K[layer] + ((int64_t)kvh*m->max_t + t)*hd;
+                    sc[t] = dot_f32(qv, kr, hd) * scale;
+                }
             }
             softmax_row(sc, qpos+1);
             float *cx = ctx + s*qw + (int64_t)hh*hd;
             for (int dd = 0; dd < hd; dd++) cx[dd] = 0;
-            for (int t = 0; t <= qpos; t++) {
-                const float *vr = m->V[layer] + ((int64_t)kvh*m->max_t + t)*hd;
-                float a = sc[t];
-                for (int dd = 0; dd < hd; dd++) cx[dd] += a * vr[dd];
+            if (kv8) {
+                const int8_t *V8c = m->V8[layer]; const float *Vsc = m->Vs[layer];
+                for (int t = 0; t <= qpos; t++) {
+                    int64_t slot = (int64_t)kvh*m->max_t + t;
+                    const int8_t *vr = V8c + slot*hd;
+                    float a = sc[t] * Vsc[slot];       /* dequant fuso nell'accumulo */
+                    for (int dd = 0; dd < hd; dd++) cx[dd] += a * (float)vr[dd];
+                }
+            } else {
+                for (int t = 0; t <= qpos; t++) {
+                    const float *vr = m->V[layer] + ((int64_t)kvh*m->max_t + t)*hd;
+                    float a = sc[t];
+                    for (int dd = 0; dd < hd; dd++) cx[dd] += a * vr[dd];
+                }
             }
         }
     }
@@ -757,10 +788,20 @@ static void kv_alloc(Model *m, int max_t) {
      * di thread dopo kv_alloc non e' supportato. */
     m->att_sc = falloc((int64_t)omp_get_max_threads() * max_t);
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
+    m->K8 = calloc(c->n_layers, sizeof(int8_t*)); m->V8 = calloc(c->n_layers, sizeof(int8_t*));
+    m->Ks = calloc(c->n_layers, sizeof(float*)); m->Vs = calloc(c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++) {
         if (c->ltype[i] == LT_LINEAR) continue;  /* i layer lineari usano lo stato, non la KV */
-        m->K[i] = falloc((int64_t)c->n_kv_heads * max_t * c->head_dim);
-        m->V[i] = falloc((int64_t)c->n_kv_heads * max_t * c->head_dim);
+        int64_t n = (int64_t)c->n_kv_heads * max_t * c->head_dim;
+        if (g_kv_bits == 8) {                    /* int8 + scala per (testa, pos): 4x meno RAM */
+            m->K8[i] = malloc(n); m->V8[i] = malloc(n);
+            if (!m->K8[i] || !m->V8[i]) { fprintf(stderr, "OOM KV int8\n"); exit(1); }
+            m->Ks[i] = falloc((int64_t)c->n_kv_heads * max_t);
+            m->Vs[i] = falloc((int64_t)c->n_kv_heads * max_t);
+        } else {
+            m->K[i] = falloc(n);
+            m->V[i] = falloc(n);
+        }
     }
     state_reset(m);
 }

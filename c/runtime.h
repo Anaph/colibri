@@ -416,6 +416,10 @@ static void model_init(Model *m, const char *snap, int qbits) {
 static int g_prefill_chunk = 0;
 static int g_skip_logits = 0;
 
+/* KV_BITS=8: KV-cache int8 con scala per (testa_kv, posizione). Default 0
+ * (f32): la numerica di REF non cambia mai in silenzio. */
+static int g_kv_bits = 0;
+
 static float *step_chunked(Model *m, const int *ids, int S, int pos_base) {
     int C = g_prefill_chunk;
     if (C <= 0 || S <= C) return step(m, ids, S, pos_base);
@@ -569,6 +573,10 @@ static int engine_main(int argc, char **argv) {
     }
     int ngen  = getenv("NGEN") ? atoi(getenv("NGEN")) : 256;
     if (getenv("PREFILL_CHUNK")) g_prefill_chunk = atoi(getenv("PREFILL_CHUNK"));
+    if (getenv("KV_BITS")) {
+        g_kv_bits = atoi(getenv("KV_BITS"));
+        if (g_kv_bits != 0 && g_kv_bits != 8) { fprintf(stderr, "KV_BITS deve essere 0 (f32) o 8 (int8)\n"); return 1; }
+    }
     /* MICRO=1: micro-RSS. La KV-cache resta l'unica voce grande -> il default
      * di contesto scende a 256 (CTX esplicito vince sempre). */
     const char *mi_ = getenv("MICRO");

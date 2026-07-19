@@ -706,6 +706,92 @@ int qt_micro_parity(void) {
     return 0;
 }
 
+/* ---- KV_BITS=8: KV-cache int8 ---- */
+int qt_kv_i8_roundtrip(void) {
+    static const int ns[] = {4, 8, 64, 128};
+    float src[128]; int8_t q[128]; float s;
+    qt_rng_s = 999;
+    for (size_t k = 0; k < sizeof ns/sizeof ns[0]; k++) {
+        int n = ns[k];
+        for (int rep = 0; rep < 8; rep++) {
+            qt_fill(src, n, 3.f);
+            kv_store_row(q, &s, src, n);
+            for (int i = 0; i < n; i++) CHECK(fabsf(src[i] - s*(float)q[i]) <= s*0.5f + 1e-7f);
+        }
+    }
+    return 0;
+}
+
+/* guida il modello sulla STESSA sequenza di token e cattura i logits di ogni
+ * step (il confronto f32-KV vs int8-KV deve restare entro tolleranza) */
+static int qt_kv8_drive(const char *dir, int kvbits, float *out, int steps, int V) {
+    g_kv_bits = kvbits;
+    Model m; model_init(&m, dir, 0);
+    kv_alloc(&m, 16);
+    if (kvbits == 8) {
+        CHECK(m.K8[0] != NULL && m.Ks[0] != NULL && m.K[0] == NULL);
+    } else {
+        CHECK(m.K[0] != NULL && m.K8[0] == NULL);
+    }
+    int prompt[3] = {1,2,3};
+    float *lo = step(&m, prompt, 3, 0);
+    memcpy(out, lo, (size_t)V*sizeof(float)); free(lo);
+    int len = 3;
+    for (int s = 1; s < steps; s++) {
+        int t = (s % 5) + 1;
+        lo = step(&m, &t, 1, len); len++;
+        memcpy(out + (int64_t)s*V, lo, (size_t)V*sizeof(float)); free(lo);
+    }
+    g_kv_bits = 0;
+    return 0;
+}
+
+int qt_kv_i8_tolerance(void) {
+    const char *dir = tst_dir("qwen_tiny_model");
+    qt_write_dense_dir(dir);
+    enum { STEPS = 6, V = 32 };
+    static float a[STEPS*V], b[STEPS*V];
+    CHECK(qt_kv8_drive(dir, 0, a, STEPS, V) == 0);
+    CHECK(qt_kv8_drive(dir, 8, b, STEPS, V) == 0);
+    for (int s = 0; s < STEPS; s++) {
+        double d2 = 0, n2 = 0;
+        for (int v = 0; v < V; v++) {
+            CHECK(isfinite(b[s*V+v]));
+            double d = (double)a[s*V+v] - b[s*V+v];
+            d2 += d*d; n2 += (double)a[s*V+v]*a[s*V+v];
+        }
+        CHECK(sqrt(d2) <= 3e-2 * (sqrt(n2) + 1e-6));   /* errore SOLO dalla KV int8 */
+    }
+    return 0;
+}
+
+/* ibrido: i layer deltanet non hanno KV (K8 NULL), quelli full girano int8 */
+int qt_kv_i8_hybrid(void) {
+    const char *dir = tst_dir("qwen_tiny_hybrid");
+    qt_write_hybrid_dir(dir);
+    g_kv_bits = 8;
+    Model m; model_init(&m, dir, 0);
+    kv_alloc(&m, 16);
+    CHECK(m.K8[0] == NULL && m.K[0] == NULL);          /* layer 0 = deltanet */
+    CHECK(m.K8[1] != NULL && m.Vs[1] != NULL);         /* layer 1 = full int8 */
+    int prompt[3] = {1,2,3}, out[16];
+    memcpy(out, prompt, sizeof(prompt));
+    float *logit = step(&m, prompt, 3, 0);
+    int len = 3;
+    for (int s = 0; s < 8; s++) {
+        for (int i = 0; i < m.c.vocab; i++) CHECK(isfinite(logit[i]));
+        int best = argmax_v(logit, m.c.vocab);
+        free(logit);
+        out[len++] = best;
+        if (s == 7) break;
+        logit = step(&m, &out[len-1], 1, len-1);
+    }
+    g_kv_bits = 0;
+    /* le scale sono state scritte davvero */
+    CHECK(m.Ks[1][0] > 0.f && m.Vs[1][0] > 0.f);
+    return 0;
+}
+
 /* ---- PREFILL_CHUNK: prefill a blocchi bit-esatto al prefill intero ---- */
 static int qt_prefill_chunk_dir(const char *dir, int hybrid) {
     static const int prompt[11] = {1,2,3,1,2,3,1,2,3,1,2};

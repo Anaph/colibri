@@ -42,6 +42,12 @@ static void (*g_mat_stream_fn)(float *y, const float *x, const struct Mat *w, in
 /* tetto sulla riga di attivazione quantizzabile al volo in matmul_q */
 #define NN_QROW_MAX 16384
 
+/* quantizza una riga KV (head_dim float) nel suo slot int8 + scala: la
+ * primitiva unica di scrittura della KV-cache int8 (KV_BITS=8) */
+static inline void kv_store_row(int8_t *dst, float *scale_slot, const float *src, int hd) {
+    *scale_slot = qrow_i8(src, dst, hd);
+}
+
 /* ---------- utility ---------- */
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec*1e-9; }
 #if defined(__APPLE__)

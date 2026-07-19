@@ -403,6 +403,7 @@ static void train_guard(Model *m, int L0) {
     if (m->qbits != 0) { fprintf(stderr, "[train] richiede pesi f32 (QBITS=0)\n"); exit(1); }
     if (m->c.hybrid)   { fprintf(stderr, "[train] training v1: solo modelli Qwen3 densi (niente layer deltanet)\n"); exit(1); }
     if (m->n_resident != m->c.n_layers) { fprintf(stderr, "[train] richiede tutti i layer residenti (niente MEM_GB/MEM_FRAC/MICRO)\n"); exit(1); }
+    if (g_kv_bits) { fprintf(stderr, "[train] richiede KV f32 (niente KV_BITS: lo stash legge m->K/V)\n"); exit(1); }
     for (int i = L0; i < m->c.n_layers; i++)
         if (m->L[i].gated) { fprintf(stderr, "[train] layer %d gated: non supportato nel range addestrato\n", i); exit(1); }
 }
