@@ -93,6 +93,9 @@ typedef struct {
     Mat ple_model_proj;         /* [n_layers*ple_dim, D] */
     float *ple_proj_norm;       /* [n_layers*ple_dim]? VERIFY: norm su ple_dim */
     float **K, **V; int kv_len, max_t;
+    /* KV_BITS=8: int8 + scala per (testa_kv, posizione) [hh*max_t + t];
+     * i layer kv-shared ALIASANO anche questi array come K/V */
+    int8_t **K8, **V8; float **Ks, **Vs;
     float *att_sc;              /* scratch punteggi attention: [n_thread][max_t] */
     /* streaming a budget (MEM_GB/MEM_FRAC), stessa semantica di qwen.c */
     int n_resident;
@@ -278,7 +281,8 @@ static int64_t fixed_bytes(Model *m, int ctx) {
         if (c->kv_src[i] != i) continue;
         int hd = c->ltype[i] == LT_FULL ? c->ghd : c->head_dim;
         int KV = c->ltype[i] == LT_FULL ? c->n_gkv : c->n_kv_heads;
-        b += (int64_t)2 * KV * ctx * hd * 4;
+        int64_t rows = (int64_t)2 * KV * ctx;
+        b += g_kv_bits == 8 ? rows*hd + rows*4 : rows*hd*4;
     }
     return b;
 }
@@ -346,8 +350,16 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         }
         for (int s = 0; s < S; s++) for (int hh = 0; hh < KV; hh++) {
             int t = pos_base + s;
-            memcpy(m->K[layer] + ((int64_t)hh*m->max_t + t)*hd, k + s*kw + (int64_t)hh*hd, hd*sizeof(float));
-            memcpy(m->V[layer] + ((int64_t)hh*m->max_t + t)*hd, vv + s*kw + (int64_t)hh*hd, hd*sizeof(float));
+            int64_t slot = (int64_t)hh*m->max_t + t;
+            if (m->K8[layer]) {                  /* KV_BITS=8: K post-RoPE e V (anche la
+                                                  * copia k_eq_v pre-RoPE) quantizzati
+                                                  * indipendentemente, ognuno con la sua scala */
+                kv_store_row(m->K8[layer] + slot*hd, &m->Ks[layer][slot], k + s*kw + (int64_t)hh*hd, hd);
+                kv_store_row(m->V8[layer] + slot*hd, &m->Vs[layer][slot], vv + s*kw + (int64_t)hh*hd, hd);
+            } else {
+                memcpy(m->K[layer] + slot*hd, k + s*kw + (int64_t)hh*hd, hd*sizeof(float));
+                memcpy(m->V[layer] + slot*hd, vv + s*kw + (int64_t)hh*hd, hd*sizeof(float));
+            }
         }
         free(k); free(vv);
     }
@@ -361,6 +373,8 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         }
     }
     float *Kc = m->K[src], *Vc = m->V[src];
+    const int8_t *K8c = m->K8[src], *V8c = m->V8[src];
+    const float *Ksc = m->Ks[src], *Vsc = m->Vs[src];
     float scale = c->qscalar > 0 ? 1.f/sqrtf(c->qscalar) : 1.f/sqrtf((float)hd);
     float *ctx = falloc(S*qw);
     #pragma omp parallel for collapse(2) schedule(static)
@@ -373,17 +387,35 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             int qpos = pos_base + s;
             int t0 = l->type == LT_FULL ? 0 : (qpos - c->window + 1 > 0 ? qpos - c->window + 1 : 0);
             const float *qv = q + s*qw + (int64_t)hh*hd;
-            for (int t = t0; t <= qpos; t++) {
-                const float *kr = Kc + ((int64_t)kvh*m->max_t + t)*hd;
-                sc[t-t0] = dot_f32(qv, kr, hd) * scale;
+            if (K8c) {
+                /* le scale si indicizzano sul t ASSOLUTO (slot), lo score sul
+                 * buffer relativo alla finestra (t-t0); q resta f32 */
+                for (int t = t0; t <= qpos; t++) {
+                    int64_t slot = (int64_t)kvh*m->max_t + t;
+                    sc[t-t0] = Ksc[slot] * dot_f32i8(qv, K8c + slot*hd, hd) * scale;
+                }
+            } else {
+                for (int t = t0; t <= qpos; t++) {
+                    const float *kr = Kc + ((int64_t)kvh*m->max_t + t)*hd;
+                    sc[t-t0] = dot_f32(qv, kr, hd) * scale;
+                }
             }
             softmax_row(sc, qpos-t0+1);
             float *cx = ctx + s*qw + (int64_t)hh*hd;
             for (int dd = 0; dd < hd; dd++) cx[dd] = 0;
-            for (int t = t0; t <= qpos; t++) {
-                const float *vr = Vc + ((int64_t)kvh*m->max_t + t)*hd;
-                float a = sc[t-t0];
-                for (int dd = 0; dd < hd; dd++) cx[dd] += a * vr[dd];
+            if (V8c) {
+                for (int t = t0; t <= qpos; t++) {
+                    int64_t slot = (int64_t)kvh*m->max_t + t;
+                    const int8_t *vr = V8c + slot*hd;
+                    float a = sc[t-t0] * Vsc[slot];    /* dequant fuso nell'accumulo */
+                    for (int dd = 0; dd < hd; dd++) cx[dd] += a * (float)vr[dd];
+                }
+            } else {
+                for (int t = t0; t <= qpos; t++) {
+                    const float *vr = Vc + ((int64_t)kvh*m->max_t + t)*hd;
+                    float a = sc[t-t0];
+                    for (int dd = 0; dd < hd; dd++) cx[dd] += a * vr[dd];
+                }
             }
         }
     }
@@ -530,15 +562,29 @@ static void kv_alloc(Model *m, int max_t) {
      * di thread dopo kv_alloc non e' supportato. */
     m->att_sc = falloc((int64_t)omp_get_max_threads() * max_t);
     m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
+    m->K8 = calloc(c->n_layers, sizeof(int8_t*)); m->V8 = calloc(c->n_layers, sizeof(int8_t*));
+    m->Ks = calloc(c->n_layers, sizeof(float*)); m->Vs = calloc(c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++) {
         if (c->kv_src[i] != i) continue;           /* i layer kv-shared leggono dal sorgente */
         int hd = c->ltype[i] == LT_FULL ? c->ghd : c->head_dim;
         int KV = c->ltype[i] == LT_FULL ? c->n_gkv : c->n_kv_heads;
-        m->K[i] = falloc((int64_t)KV * max_t * hd);
-        m->V[i] = falloc((int64_t)KV * max_t * hd);
+        int64_t n = (int64_t)KV * max_t * hd;
+        if (g_kv_bits == 8) {
+            m->K8[i] = malloc(n); m->V8[i] = malloc(n);
+            if (!m->K8[i] || !m->V8[i]) { fprintf(stderr, "OOM KV int8\n"); exit(1); }
+            m->Ks[i] = falloc((int64_t)KV * max_t);
+            m->Vs[i] = falloc((int64_t)KV * max_t);
+        } else {
+            m->K[i] = falloc(n);
+            m->V[i] = falloc(n);
+        }
     }
     for (int i = 0; i < c->n_layers; i++)
-        if (c->kv_src[i] != i) { m->K[i] = m->K[c->kv_src[i]]; m->V[i] = m->V[c->kv_src[i]]; }
+        if (c->kv_src[i] != i) {                   /* alias del sorgente, scale comprese */
+            m->K[i] = m->K[c->kv_src[i]];   m->V[i] = m->V[c->kv_src[i]];
+            m->K8[i] = m->K8[c->kv_src[i]]; m->V8[i] = m->V8[c->kv_src[i]];
+            m->Ks[i] = m->Ks[c->kv_src[i]]; m->Vs[i] = m->Vs[c->kv_src[i]];
+        }
 }
 
 /* costruisce il turno chat Gemma */

@@ -236,6 +236,59 @@ int gm_tiny(void) {
     return 0;
 }
 
+/* ---- KV_BITS=8 su gemma: sliding window, kv-shared, k_eq_v ---- */
+
+/* stessa sequenza di token con KV f32 vs int8, logits per step catturati.
+ * Il prompt (11) supera la finestra (4): un bug di indicizzazione assoluta/
+ * relativa delle scale farebbe esplodere le differenze, non restare al ~%. */
+static int gm_kv8_drive(const char *dir, int shared, int keqv, int kvbits, float *out, int steps, int V) {
+    gm_write_tiny(dir, shared, keqv);
+    g_kv_bits = kvbits;
+    Model m; model_init(&m, dir, 0);
+    kv_alloc(&m, 16);
+    if (kvbits == 8) {
+        CHECK(m.K8[0] != NULL && m.Ks[0] != NULL && m.K[0] == NULL);
+        if (shared) {                              /* alias: dati E scale */
+            CHECK(m.K8[3] == m.K8[m.c.kv_src[3]] && m.Ks[3] == m.Ks[m.c.kv_src[3]]);
+            CHECK(m.V8[3] == m.V8[m.c.kv_src[3]] && m.Vs[3] == m.Vs[m.c.kv_src[3]]);
+        }
+    }
+    int prompt[3] = {1,2,3};
+    float *lo = step(&m, prompt, 3, 0);
+    memcpy(out, lo, (size_t)V*sizeof(float)); free(lo);
+    int len = 3;
+    for (int s = 1; s < steps; s++) {
+        int t = (s % 5) + 1;
+        lo = step(&m, &t, 1, len); len++;
+        memcpy(out + (int64_t)s*V, lo, (size_t)V*sizeof(float)); free(lo);
+    }
+    g_kv_bits = 0;
+    return 0;
+}
+
+static int gm_kv8_case(const char *name, int shared, int keqv) {
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s", tst_dir(name));
+    enum { STEPS = 9, V = 32 };
+    static float a[STEPS*V], b[STEPS*V];
+    CHECK(gm_kv8_drive(dir, shared, keqv, 0, a, STEPS, V) == 0);
+    CHECK(gm_kv8_drive(dir, shared, keqv, 8, b, STEPS, V) == 0);
+    for (int s = 0; s < STEPS; s++) {
+        double d2 = 0, n2 = 0;
+        for (int v = 0; v < V; v++) {
+            CHECK(isfinite(b[s*V+v]));
+            double d = (double)a[s*V+v] - b[s*V+v];
+            d2 += d*d; n2 += (double)a[s*V+v]*a[s*V+v];
+        }
+        CHECK(sqrt(d2) <= 3e-2 * (sqrt(n2) + 1e-6));
+    }
+    return 0;
+}
+
+int gm_kv_i8_sliding(void) { return gm_kv8_case("gemma_tiny_kv8",        0, 0); }
+int gm_kv_i8_shared(void)  { return gm_kv8_case("gemma_tiny_kv8_shared", 1, 0); }
+int gm_kv_i8_keqv(void)    { return gm_kv8_case("gemma_tiny_kv8_keqv",   0, 1); }
+
 /* PREFILL_CHUNK bit-esatto anche con sliding window (window=4 < prompt=11,
  * confini dei blocchi DENTRO la finestra) */
 int gm_prefill_chunk(void) {
