@@ -197,6 +197,38 @@ static void gm_write_tiny(const char *dir, int kv_shared, int k_eq_v) {
     tst_write(dir);
 }
 
+/* prefill {1,2,3} + 8 passi greedy con guardia isfinite (gemello del ciclo
+ * condiviso di qwen_tests.c) */
+static int drive_greedy8(Model *m, int *out) {
+    int prompt[3] = {1,2,3};
+    memcpy(out, prompt, sizeof(prompt));
+    float *logit = step(m, prompt, 3, 0);
+    int len = 3;
+    for (int s = 0; s < 8; s++) {
+        for (int i = 0; i < m->c.vocab; i++) CHECK(isfinite(logit[i]));
+        int best = argmax_v(logit, m->c.vocab);
+        free(logit);
+        out[len++] = best;
+        if (s == 7) break;
+        logit = step(m, &out[len-1], 1, len-1);
+    }
+    return 0;
+}
+
+/* logits di ogni step sulla stessa sequenza deterministica, in out[steps][V] */
+static int drive_capture(Model *m, float *out, int steps, int V) {
+    int prompt[3] = {1,2,3};
+    float *lo = step(m, prompt, 3, 0);
+    memcpy(out, lo, (size_t)V*sizeof(float)); free(lo);
+    int len = 3;
+    for (int s = 1; s < steps; s++) {
+        int t = (s % 5) + 1;
+        lo = step(m, &t, 1, len); len++;
+        memcpy(out + (int64_t)s*V, lo, (size_t)V*sizeof(float)); free(lo);
+    }
+    return 0;
+}
+
 static int gm_run8(const char *dir, int qbits, int *out, int expect_shared, int expect_keqv) {
     Model m;
     model_init(&m, dir, qbits);
@@ -209,19 +241,7 @@ static int gm_run8(const char *dir, int qbits, int *out, int expect_shared, int 
     }
     if (expect_keqv) CHECK(m.c.k_eq_v && !m.L[0].v.f && !m.L[0].v.q);
     kv_alloc(&m, 16);
-    int prompt[3] = {1,2,3};
-    memcpy(out, prompt, sizeof(prompt));
-    float *logit = step(&m, prompt, 3, 0);
-    int len = 3;
-    for (int s = 0; s < 8; s++) {
-        for (int i = 0; i < m.c.vocab; i++) CHECK(isfinite(logit[i]));
-        int best = argmax_v(logit, m.c.vocab);
-        free(logit);
-        out[len++] = best;
-        if (s == 7) break;
-        logit = step(&m, &out[len-1], 1, len-1);
-    }
-    return 0;
+    return drive_greedy8(&m, out);
 }
 
 int gm_tiny(void) {
@@ -253,17 +273,9 @@ static int gm_kv8_drive(const char *dir, int shared, int keqv, int kvbits, float
             CHECK(m.V8[3] == m.V8[m.c.kv_src[3]] && m.Vs[3] == m.Vs[m.c.kv_src[3]]);
         }
     }
-    int prompt[3] = {1,2,3};
-    float *lo = step(&m, prompt, 3, 0);
-    memcpy(out, lo, (size_t)V*sizeof(float)); free(lo);
-    int len = 3;
-    for (int s = 1; s < steps; s++) {
-        int t = (s % 5) + 1;
-        lo = step(&m, &t, 1, len); len++;
-        memcpy(out + (int64_t)s*V, lo, (size_t)V*sizeof(float)); free(lo);
-    }
+    int rc = drive_capture(&m, out, steps, V);
     g_kv_bits = 0;
-    return 0;
+    return rc;
 }
 
 static int gm_kv8_case(const char *name, int shared, int keqv) {
@@ -331,19 +343,7 @@ static int gm_run8_budget(const char *dir, int64_t budget, int *out, int *reside
     model_init_ex(&m, dir, 0, budget, 16);
     if (resident_out) *resident_out = m.n_resident;
     kv_alloc(&m, 16);
-    int prompt[3] = {1,2,3};
-    memcpy(out, prompt, sizeof(prompt));
-    float *logit = step(&m, prompt, 3, 0);
-    int len = 3;
-    for (int s = 0; s < 8; s++) {
-        for (int i = 0; i < m.c.vocab; i++) CHECK(isfinite(logit[i]));
-        int best = argmax_v(logit, m.c.vocab);
-        free(logit);
-        out[len++] = best;
-        if (s == 7) break;
-        logit = step(&m, &out[len-1], 1, len-1);
-    }
-    return 0;
+    return drive_greedy8(&m, out);
 }
 
 int gm_memknob_parity(void) {

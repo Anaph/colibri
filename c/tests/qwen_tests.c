@@ -483,8 +483,35 @@ static void qt_write_hybrid_dir(const char *dir) {
     tst_write(dir);
 }
 
-/* greedy 8 token dal prompt {1,2,3}; out deve avere spazio per 11.
- * Ritorna 0/1; verifica strutture (tied, head_dim, ibrido). */
+/* prefill {1,2,3} + 8 passi greedy con guardia isfinite; out ha spazio per
+ * 11 id. Il modello arriva gia' model_init'd + kv_alloc'd: era il ciclo
+ * copiato in sei test. */
+static int drive_greedy8(Model *m, int *out) {
+    int prompt[3] = {1,2,3};
+    memcpy(out, prompt, sizeof(prompt));
+    float *logit = step(m, prompt, 3, 0);
+    int len = 3;
+    for (int s = 0; s < 8; s++) {
+        for (int i = 0; i < m->c.vocab; i++) CHECK(isfinite(logit[i]));
+        int best = argmax_v(logit, m->c.vocab);
+        free(logit);
+        out[len++] = best;
+        if (s == 7) break;
+        logit = step(m, &out[len-1], 1, len-1);
+    }
+    return 0;
+}
+
+/* tst_dir ritorna un buffer statico: copia i due percorsi e scrive entrambi
+ * i modelli tiny (buffer da almeno 512 byte) */
+static void qt_setup_both(char *dense, char *hyb) {
+    snprintf(dense, 512, "%s", tst_dir("qwen_tiny_model"));
+    snprintf(hyb,   512, "%s", tst_dir("qwen_tiny_hybrid"));
+    qt_write_dense_dir(dense);
+    qt_write_hybrid_dir(hyb);
+}
+
+/* greedy 8 token; verifica anche le strutture (tied, head_dim, ibrido) */
 static int qt_run8(const char *dir, int qbits, int hybrid, int *out) {
     Model m;
     model_init(&m, dir, qbits);
@@ -497,19 +524,7 @@ static int qt_run8(const char *dir, int qbits, int hybrid, int *out) {
         CHECK(m.c.rot == 4);
     }
     kv_alloc(&m, 16);
-    int prompt[3] = {1,2,3};
-    memcpy(out, prompt, sizeof(prompt));
-    float *logit = step(&m, prompt, 3, 0);
-    int len = 3;
-    for (int s = 0; s < 8; s++) {
-        for (int i = 0; i < m.c.vocab; i++) CHECK(isfinite(logit[i]));
-        int best = argmax_v(logit, m.c.vocab);
-        free(logit);
-        out[len++] = best;
-        if (s == 7) break;
-        logit = step(&m, &out[len-1], 1, len-1);
-    }
-    return 0;
+    return drive_greedy8(&m, out);
 }
 
 int qt_tiny_dense(void) {
@@ -533,10 +548,7 @@ int qt_tiny_qbits(void) {
  * su dense e ibrido */
 int qt_tiny_qbits4(void) {
     char dense[512], hyb[512];
-    snprintf(dense, sizeof(dense), "%s", tst_dir("qwen_tiny_model"));
-    snprintf(hyb,   sizeof(hyb),   "%s", tst_dir("qwen_tiny_hybrid"));
-    qt_write_dense_dir(dense);
-    qt_write_hybrid_dir(hyb);
+    qt_setup_both(dense, hyb);
     int a[16], b[16];
     CHECK(qt_run8(dense, 4, 0, a) == 0);
     CHECK(qt_run8(dense, 4, 0, b) == 0);
@@ -568,32 +580,16 @@ static int qt_run8_budget(const char *dir, int qbits, int64_t budget, int *out, 
     model_init_ex(&m, dir, qbits, budget, 16);
     if (resident_out) *resident_out = m.n_resident;
     kv_alloc(&m, 16);
-    int prompt[3] = {1,2,3};
-    memcpy(out, prompt, sizeof(prompt));
-    float *logit = step(&m, prompt, 3, 0);
-    int len = 3;
-    for (int s = 0; s < 8; s++) {
-        for (int i = 0; i < m.c.vocab; i++) CHECK(isfinite(logit[i]));
-        int best = argmax_v(logit, m.c.vocab);
-        free(logit);
-        out[len++] = best;
-        if (s == 7) break;
-        logit = step(&m, &out[len-1], 1, len-1);
-    }
-    return 0;
+    return drive_greedy8(&m, out);
 }
 
 int qt_memknob_parity(void) {
     /* stessi id greedy con: tutto residente (budget 0), tutto streamato
      * (budget minuscolo -> R=0) e budget enorme (R=n_layers) — sia sul
      * modello denso che sull'ibrido (stati deltanet sempre residenti) */
-    /* tst_dir ritorna un buffer statico: copie locali obbligatorie */
     char dense[512], hyb[512];
-    snprintf(dense, sizeof(dense), "%s", tst_dir("qwen_tiny_model"));
-    snprintf(hyb,   sizeof(hyb),   "%s", tst_dir("qwen_tiny_hybrid"));
+    qt_setup_both(dense, hyb);
     const char *dirs[2] = { dense, hyb };
-    qt_write_dense_dir(dirs[0]);
-    qt_write_hybrid_dir(dirs[1]);
     for (int d = 0; d < 2; d++) {
         int a[16], b[16], cc[16]; int r0, r1, r2;
         CHECK(qt_run8_budget(dirs[d], 0, 0, a, &r0) == 0);                 /* classico */
@@ -609,11 +605,8 @@ int qt_memknob_parity(void) {
  * la quantizzazione per riga rende i token IDENTICI a tutto-residente */
 int qt_memknob_q8_parity(void) {
     char dense[512], hyb[512];
-    snprintf(dense, sizeof(dense), "%s", tst_dir("qwen_tiny_model"));
-    snprintf(hyb,   sizeof(hyb),   "%s", tst_dir("qwen_tiny_hybrid"));
+    qt_setup_both(dense, hyb);
     const char *dirs[2] = { dense, hyb };
-    qt_write_dense_dir(dirs[0]);
-    qt_write_hybrid_dir(dirs[1]);
     for (int d = 0; d < 2; d++) {
         int a[16], b[16]; int r0, r1;
         CHECK(qt_run8_budget(dirs[d], 8, 0, a, &r0) == 0);                 /* int8 residente */
@@ -646,20 +639,9 @@ static int qt_run8_micro(const char *dir, int *out) {
     CHECK(m.stream_buf == NULL);
     CHECK(m.lm_tied && m.lm_head.sh != NULL && m.lm_head.f == NULL);
     kv_alloc(&m, 16);
-    int prompt[3] = {1,2,3};
-    memcpy(out, prompt, sizeof(prompt));
-    float *logit = step(&m, prompt, 3, 0);
-    int len = 3;
-    for (int s = 0; s < 8; s++) {
-        for (int i = 0; i < m.c.vocab; i++) CHECK(isfinite(logit[i]));
-        int best = argmax_v(logit, m.c.vocab);
-        free(logit);
-        out[len++] = best;
-        if (s == 7) break;
-        logit = step(&m, &out[len-1], 1, len-1);
-    }
+    int rc = drive_greedy8(&m, out);
     g_micro = 0; g_mat_stream_fn = NULL; g_micro_chunk = 4<<20;
-    return 0;
+    return rc;
 }
 
 /* ---- QBITS=8 quantizza anche l'embed: loader a blocchi bit-identico alla
@@ -691,13 +673,9 @@ int qt_embed_q8(void) {
 }
 
 int qt_micro_parity(void) {
-    /* tst_dir ritorna un buffer statico: copie locali obbligatorie */
     char dense[512], hyb[512];
-    snprintf(dense, sizeof(dense), "%s", tst_dir("qwen_tiny_model"));
-    snprintf(hyb,   sizeof(hyb),   "%s", tst_dir("qwen_tiny_hybrid"));
+    qt_setup_both(dense, hyb);
     const char *dirs[2] = { dense, hyb };
-    qt_write_dense_dir(dirs[0]);
-    qt_write_hybrid_dir(dirs[1]);
     for (int d = 0; d < 2; d++) {
         int a[16], b[16];
         CHECK(qt_run8(dirs[d], 0, d, a) == 0);
@@ -838,8 +816,23 @@ int qt_kv_i8_roundtrip(void) {
     return 0;
 }
 
-/* guida il modello sulla STESSA sequenza di token e cattura i logits di ogni
- * step (il confronto f32-KV vs int8-KV deve restare entro tolleranza) */
+/* prefill {1,2,3} + decode sulla STESSA sequenza deterministica di token,
+ * logits di ogni step catturati in out[steps][V] (ciclo condiviso col
+ * gemello gemma) */
+static int drive_capture(Model *m, float *out, int steps, int V) {
+    int prompt[3] = {1,2,3};
+    float *lo = step(m, prompt, 3, 0);
+    memcpy(out, lo, (size_t)V*sizeof(float)); free(lo);
+    int len = 3;
+    for (int s = 1; s < steps; s++) {
+        int t = (s % 5) + 1;
+        lo = step(m, &t, 1, len); len++;
+        memcpy(out + (int64_t)s*V, lo, (size_t)V*sizeof(float)); free(lo);
+    }
+    return 0;
+}
+
+/* confronto f32-KV vs int8-KV: deve restare entro tolleranza */
 static int qt_kv8_drive(const char *dir, int kvbits, float *out, int steps, int V) {
     g_kv_bits = kvbits;
     Model m; model_init(&m, dir, 0);
@@ -849,17 +842,9 @@ static int qt_kv8_drive(const char *dir, int kvbits, float *out, int steps, int 
     } else {
         CHECK(m.K[0] != NULL && m.K8[0] == NULL);
     }
-    int prompt[3] = {1,2,3};
-    float *lo = step(&m, prompt, 3, 0);
-    memcpy(out, lo, (size_t)V*sizeof(float)); free(lo);
-    int len = 3;
-    for (int s = 1; s < steps; s++) {
-        int t = (s % 5) + 1;
-        lo = step(&m, &t, 1, len); len++;
-        memcpy(out + (int64_t)s*V, lo, (size_t)V*sizeof(float)); free(lo);
-    }
+    int rc = drive_capture(&m, out, steps, V);
     g_kv_bits = 0;
-    return 0;
+    return rc;
 }
 
 int qt_kv_i8_tolerance(void) {
@@ -890,18 +875,8 @@ int qt_kv_i8_hybrid(void) {
     kv_alloc(&m, 16);
     CHECK(m.K8[0] == NULL && m.K[0] == NULL);          /* layer 0 = deltanet */
     CHECK(m.K8[1] != NULL && m.Vs[1] != NULL);         /* layer 1 = full int8 */
-    int prompt[3] = {1,2,3}, out[16];
-    memcpy(out, prompt, sizeof(prompt));
-    float *logit = step(&m, prompt, 3, 0);
-    int len = 3;
-    for (int s = 0; s < 8; s++) {
-        for (int i = 0; i < m.c.vocab; i++) CHECK(isfinite(logit[i]));
-        int best = argmax_v(logit, m.c.vocab);
-        free(logit);
-        out[len++] = best;
-        if (s == 7) break;
-        logit = step(&m, &out[len-1], 1, len-1);
-    }
+    int out[16];
+    CHECK(drive_greedy8(&m, out) == 0);
     g_kv_bits = 0;
     /* le scale sono state scritte davvero */
     CHECK(m.Ks[1][0] > 0.f && m.Vs[1][0] > 0.f);
@@ -933,10 +908,7 @@ static int qt_prefill_chunk_dir(const char *dir, int hybrid) {
 
 int qt_prefill_chunk(void) {
     char dense[512], hyb[512];
-    snprintf(dense, sizeof(dense), "%s", tst_dir("qwen_tiny_model"));
-    snprintf(hyb,   sizeof(hyb),   "%s", tst_dir("qwen_tiny_hybrid"));
-    qt_write_dense_dir(dense);
-    qt_write_hybrid_dir(hyb);
+    qt_setup_both(dense, hyb);
     CHECK(qt_prefill_chunk_dir(dense, 0) == 0);
     CHECK(qt_prefill_chunk_dir(hyb, 1) == 0);     /* deltanet: ricorrenza gia' per token */
     return 0;
