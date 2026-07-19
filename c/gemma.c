@@ -571,8 +571,7 @@ static void kv_alloc(Model *m, int max_t) {
         int KV = c->ltype[i] == LT_FULL ? c->n_gkv : c->n_kv_heads;
         int64_t n = (int64_t)KV * max_t * hd;
         if (g_kv_bits == 8) {
-            m->K8[i] = malloc(n); m->V8[i] = malloc(n);
-            if (!m->K8[i] || !m->V8[i]) { fprintf(stderr, "OOM KV int8\n"); exit(1); }
+            m->K8[i] = balloc(n, "KV int8"); m->V8[i] = balloc(n, "KV int8");
             m->Ks[i] = falloc((int64_t)KV * max_t);
             m->Vs[i] = falloc((int64_t)KV * max_t);
         } else {

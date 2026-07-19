@@ -119,17 +119,15 @@ static int g_qgroup = 32;
 /* carica [O,I] e quantizza secondo bits: 0=f32, 8=int8+scala per riga,
  * 4=int4 impacchettato con scale per gruppo (g_qgroup; 0 -> per riga) */
 static void load_mat_bits(Model *m, Mat *w, const char *name, int O, int I, int bits) {
-    w->O = O; w->I = I; w->q = NULL; w->qs = NULL; w->sh = NULL; w->sname = NULL;
-    w->q4 = NULL; w->gs = 0;
+    mat_reset_storage(w);
+    w->O = O; w->I = I;
     /* GGUF Q4_0 + QBITS=4 con gruppo 32: repack LOSSLESS (pura permutazione
      * di nibble, gguf.h) invece di dequant+requant — stessi bit del file */
     if (bits == 4 && g_qgroup == 32 && I % 32 == 0 && st_dtype(&m->S, name) == ST_Q4_0) {
         st_tensor *t = st_expect(&m->S, name, (int64_t)O*I);
-        void *raw = malloc(t->nbytes);
-        if (!raw) { fprintf(stderr, "OOM raw %s\n", name); exit(1); }
+        void *raw = balloc(t->nbytes, name);
         st_read_raw(&m->S, name, raw, 0);
-        w->q4 = malloc((int64_t)O*(I/2)); w->qs = falloc((int64_t)O*(I/32));
-        if (!w->q4) { fprintf(stderr, "OOM quant %s\n", name); exit(1); }
+        w->q4 = balloc((int64_t)O*(I/2), name); w->qs = falloc((int64_t)O*(I/32));
         gguf_repack_q4_0(raw, w->q4, w->qs, O, I);
         free(raw);
         w->gs = 32;
@@ -137,15 +135,13 @@ static void load_mat_bits(Model *m, Mat *w, const char *name, int O, int I, int 
     }
     w->f = load_t(m, name, (int64_t)O*I);
     if (bits == 8) {
-        w->q = malloc((int64_t)O*I); w->qs = falloc(O);
-        if (!w->q) { fprintf(stderr,"OOM quant %s\n",name); exit(1); }
+        w->q = balloc((int64_t)O*I, name); w->qs = falloc(O);
         quantize_rows(w->f, w->q, w->qs, O, I, 8);
         free(w->f); w->f = NULL;
     } else if (bits == 4) {
         int gs = g_qgroup;
         int64_t rb = ((int64_t)I+1)/2, ng = gs > 0 ? ((int64_t)I+gs-1)/gs : 1;
-        w->q4 = malloc((int64_t)O*rb); w->qs = falloc((int64_t)O*ng);
-        if (!w->q4) { fprintf(stderr,"OOM quant %s\n",name); exit(1); }
+        w->q4 = balloc((int64_t)O*rb, name); w->qs = falloc((int64_t)O*ng);
         if (gs > 0) pack_int4_grouped(w->f, w->q4, w->qs, O, I, gs);
         else pack_int4(w->f, w->q4, w->qs, O, I);
         w->gs = gs;
@@ -166,9 +162,8 @@ static int g_embed_chunk_rows = 8192;
 static void load_embed_q8(Model *m) {
     Cfg *c = &m->c; int D = c->hidden; int64_t V = c->vocab;
     st_expect(&m->S, "model.embed_tokens.weight", V*D);
-    m->embed_q  = malloc(V*D);
+    m->embed_q  = balloc(V*D, "embed int8");
     m->embed_qs = falloc(V);
-    if (!m->embed_q) { fprintf(stderr, "OOM quant embed\n"); exit(1); }
     int rows = g_embed_chunk_rows; if (rows < 1) rows = 1;
     float *scratch = falloc((int64_t)rows*D);
     for (int64_t v = 0; v < V; v += rows) {
@@ -200,18 +195,14 @@ static void layer_stream_in(Model *m, int li) {
         for (int j = 0; j < n; j++) {
             int O = r[j].O, I = r[j].I;
             int rows = (int)((4 << 20) / ((int64_t)I * 4)); if (rows < 1) rows = 1;
-            if ((int64_t)rows*I > ccap) {
-                ccap = (int64_t)rows*I;
-                chunk = realloc(chunk, ccap*sizeof(float));
-                if (!chunk) { fprintf(stderr, "OOM stream chunk\n"); exit(1); }
-            }
+            grow((void **)&chunk, &ccap, (int64_t)rows*I, sizeof(float), "chunk streaming");
             for (int64_t o = 0; o < O; o += rows) {
                 int64_t rr = O - o < rows ? O - o : rows;
                 st_read_slice_f32(&m->S, r[j].name, o*I, rr*I, chunk, 0);
                 quantize_rows(chunk, m->stream_q + qoff + o*I, m->stream_qs + soff + o, (int)rr, I, 8);
             }
+            mat_reset_storage(r[j].mat);
             r[j].mat->q = m->stream_q + qoff; r[j].mat->qs = m->stream_qs + soff;
-            r[j].mat->f = NULL; r[j].mat->sh = NULL; r[j].mat->q4 = NULL; r[j].mat->gs = 0;
             r[j].mat->O = O; r[j].mat->I = I;
             qoff += (int64_t)O*I; soff += O;
         }
@@ -220,9 +211,8 @@ static void layer_stream_in(Model *m, int li) {
     int64_t off = 0;
     for (int j = 0; j < n; j++) {
         st_read_f32(&m->S, r[j].name, m->stream_buf + off, 0);  /* drop=0: la page cache aiuta */
+        mat_reset_storage(r[j].mat);
         r[j].mat->f = m->stream_buf + off;
-        r[j].mat->q = NULL; r[j].mat->qs = NULL; r[j].mat->sh = NULL;
-        r[j].mat->q4 = NULL; r[j].mat->gs = 0;
         r[j].mat->O = r[j].O; r[j].mat->I = r[j].I;
         off += (int64_t)r[j].O*r[j].I;
     }
@@ -261,11 +251,7 @@ static void mat_stream(float *y, const float *x, const Mat *w, int S) {
     if (rows < 1) rows = 1;
     if (rows > O) rows = O;
     static float *buf = NULL; static int64_t cap = 0;
-    if ((int64_t)rows * I > cap) {
-        cap = (int64_t)rows * I;
-        buf = realloc(buf, cap * sizeof(float));
-        if (!buf) { fprintf(stderr, "OOM micro scratch %ld\n", (long)cap); exit(1); }
-    }
+    grow((void **)&buf, &cap, (int64_t)rows * I, sizeof(float), "scratch micro");
     for (int o0 = 0; o0 < O; o0 += rows) {
         int r = O - o0 < rows ? O - o0 : rows;
         st_read_slice_f32(Sh, w->sname, (int64_t)o0 * I, (int64_t)r * I, buf, g_micro_drop);
@@ -279,7 +265,7 @@ static void mat_stream(float *y, const float *x, const Mat *w, int S) {
 /* prepara una Mat streamata: dims validate contro il file, nessun dato letto */
 static void mat_stream_init(Model *m, Mat *w, const char *name, int O, int I) {
     st_expect(&m->S, name, (int64_t)O*I);
-    w->f = NULL; w->q = NULL; w->qs = NULL; w->q4 = NULL; w->gs = 0;
+    mat_reset_storage(w);
     w->O = O; w->I = I;
     w->sh = &m->S; w->sname = strdup(name);
 }
@@ -329,8 +315,8 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
     if (m->qbits) load_embed_q8(m);
     else m->embed = load_t(m, "model.embed_tokens.weight", (int64_t)c->vocab*D);
     if (m->lm_tied) {
+        mat_reset_storage(&m->lm_head);
         m->lm_head.f = m->embed; m->lm_head.q = m->embed_q; m->lm_head.qs = m->embed_qs;
-        m->lm_head.sh=NULL; m->lm_head.sname=NULL;
         m->lm_head.O = c->vocab; m->lm_head.I = D;
     } else {
         /* testa non condivisa: int8 anche con QBITS=4 (vedi sopra) */
@@ -375,7 +361,7 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
             if (i < m->n_resident) load_mat(m, r[j].mat, r[j].name, r[j].O, r[j].I);
             else {
                 st_expect(&m->S, r[j].name, (int64_t)r[j].O*r[j].I);
-                r[j].mat->f = NULL; r[j].mat->q = NULL; r[j].mat->qs = NULL;
+                mat_reset_storage(r[j].mat);
                 r[j].mat->O = r[j].O; r[j].mat->I = r[j].I;
             }
         }
@@ -391,9 +377,8 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
             if (rows > rmax) rmax = rows;
         }
         if (m->qbits == 8) {
-            m->stream_q = malloc(smax/4);          /* int8: 1 byte per elemento f32 */
+            m->stream_q = balloc(smax/4, "scratch stream int8");  /* 1 byte per elemento f32 */
             m->stream_qs = falloc(rmax);
-            if (!m->stream_q) { fprintf(stderr, "OOM stream_q\n"); exit(1); }
         } else {
             m->stream_buf = falloc(smax/4);
         }

@@ -39,6 +39,15 @@ typedef struct Mat { float *f; int8_t *q; float *qs; int O, I;
                      const void *sh; const char *sname; } Mat;
 static void (*g_mat_stream_fn)(float *y, const float *x, const struct Mat *w, int S) = NULL;
 
+/* azzera TUTTI i discriminatori di storage di una Mat: prima era open-coded
+ * in sei posti con sottoinsiemi DIVERSI dei campi (bug-surface a ogni campo
+ * nuovo). O/I restano al chiamante. */
+static inline void mat_reset_storage(Mat *w) {
+    w->f = NULL; w->q = NULL; w->qs = NULL;
+    w->q4 = NULL; w->gs = 0;
+    w->sh = NULL; w->sname = NULL;
+}
+
 /* tetto sulla riga di attivazione quantizzabile al volo in matmul_q */
 #define NN_QROW_MAX 16384
 
@@ -55,7 +64,28 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 #else
 static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return r.ru_maxrss / (1024.0*1024.0); }
 #endif
-static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
+/* allocatori con check: UN solo formato di messaggio OOM (prima: sette
+ * varianti scritte a mano nei call site) */
+static void *balloc(int64_t n, const char *what) {
+    void *p = malloc(n > 0 ? n : 1);
+    if (!p) { fprintf(stderr, "OOM %s (%lld byte)\n", what, (long long)n); exit(1); }
+    return p;
+}
+static void *bzalloc(int64_t n, const char *what) {
+    void *p = calloc(1, n > 0 ? n : 1);
+    if (!p) { fprintf(stderr, "OOM %s (%lld byte)\n", what, (long long)n); exit(1); }
+    return p;
+}
+static float *falloc(int64_t n) { return (float *)balloc(n*sizeof(float), "f32"); }
+
+/* scratch che cresce e basta (l'idioma static-grow dei kernel: contratto di
+ * chiamata SERIALE, mai da dentro una regione parallela) */
+static void grow(void **p, int64_t *cap, int64_t need, size_t esz, const char *what) {
+    if (need <= *cap) return;
+    *cap = need;
+    *p = realloc(*p, (size_t)need * esz);
+    if (!*p) { fprintf(stderr, "OOM %s (%lld x %zu byte)\n", what, (long long)need, esz); exit(1); }
+}
 
 /* y[S,O] = x[S,I] @ W^T,  W e' [O,I] row-major */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
@@ -82,16 +112,8 @@ static void matmul_q_s(float *y, const float *x, const int8_t *q, const float *s
     if (idot && I <= NN_QROW_MAX) {
         static int8_t *xi = NULL; static float *sx = NULL;
         static int64_t xcap = 0, scap = 0;
-        if ((int64_t)S*I > xcap) {
-            xcap = (int64_t)S*I;
-            xi = realloc(xi, xcap);
-            if (!xi) { fprintf(stderr, "OOM %ld\n", (long)xcap); exit(1); }
-        }
-        if (S > scap) {
-            scap = S;
-            sx = realloc(sx, scap*sizeof(float));
-            if (!sx) { fprintf(stderr, "OOM %ld\n", (long)scap); exit(1); }
-        }
+        grow((void **)&xi, &xcap, (int64_t)S*I, 1, "attivazioni int8");
+        grow((void **)&sx, &scap, S, sizeof(float), "scale attivazioni");
         for (int s = 0; s < S; s++) sx[s] = qrow_i8(x + (int64_t)s*I, xi + (int64_t)s*I, I);
         #pragma omp parallel for schedule(static)
         for (int o = 0; o < O; o++) {
