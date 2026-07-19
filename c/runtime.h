@@ -68,11 +68,9 @@ static jval *cfg_slurp(const char *snap, jval **root_out, char **buf_out) {
         buf = gguf_synth_config(&g_gguf_meta);      /* metadati -> JSON con chiavi HF */
     } else {
         char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap);
-        FILE *f = fopen(path, "rb"); if(!f){perror(path);exit(1);}
-        fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
-        buf = malloc(n+1); if(fread(buf,1,n,f)!=(size_t)n){} buf[n]=0; fclose(f);
+        buf = slurp_file(path, NULL);
     }
-    jval *root = json_parse(buf, NULL);
+    jval *root = json_parse(buf);
     jval *r = root;
     jval *tc = json_get(root,"text_config"); if (tc && tc->t==J_OBJ) r = tc;
     *root_out = root; *buf_out = buf;
@@ -109,14 +107,8 @@ static void cfg_common(jval *r, Cfg *c) {
 
 /* ---------- caricamento pesi ---------- */
 static float *load_t(Model *m, const char *name, int64_t expect) {
-    int64_t n = st_numel(&m->S, name);
-    if (n < 0) { fprintf(stderr, "missing tensor %s\n", name); exit(1); }
-    if (expect > 0 && n != expect) {
-        fprintf(stderr, "tensor %s: numel %lld != atteso %lld (layout diverso?)\n",
-                name, (long long)n, (long long)expect);
-        exit(1);
-    }
-    float *p = falloc(n);
+    st_tensor *t = st_expect(&m->S, name, expect);
+    float *p = falloc(t->numel);
     st_read_f32(&m->S, name, p, 0);
     return p;
 }
@@ -132,12 +124,7 @@ static void load_mat_bits(Model *m, Mat *w, const char *name, int O, int I, int 
     /* GGUF Q4_0 + QBITS=4 con gruppo 32: repack LOSSLESS (pura permutazione
      * di nibble, gguf.h) invece di dequant+requant — stessi bit del file */
     if (bits == 4 && g_qgroup == 32 && I % 32 == 0 && st_dtype(&m->S, name) == ST_Q4_0) {
-        st_tensor *t = st_find(&m->S, name);
-        if (t->numel != (int64_t)O*I) {
-            fprintf(stderr, "tensor %s: numel %lld != atteso %lld\n",
-                    name, (long long)t->numel, (long long)((int64_t)O*I));
-            exit(1);
-        }
+        st_tensor *t = st_expect(&m->S, name, (int64_t)O*I);
         void *raw = malloc(t->nbytes);
         if (!raw) { fprintf(stderr, "OOM raw %s\n", name); exit(1); }
         st_read_raw(&m->S, name, raw, 0);
@@ -178,12 +165,7 @@ static void load_mat(Model *m, Mat *w, const char *name, int O, int I) {
 static int g_embed_chunk_rows = 8192;
 static void load_embed_q8(Model *m) {
     Cfg *c = &m->c; int D = c->hidden; int64_t V = c->vocab;
-    int64_t n = st_numel(&m->S, "model.embed_tokens.weight");
-    if (n != V*D) {
-        fprintf(stderr, "tensor model.embed_tokens.weight: numel %lld != atteso %lld\n",
-                (long long)n, (long long)(V*D));
-        exit(1);
-    }
+    st_expect(&m->S, "model.embed_tokens.weight", V*D);
     m->embed_q  = malloc(V*D);
     m->embed_qs = falloc(V);
     if (!m->embed_q) { fprintf(stderr, "OOM quant embed\n"); exit(1); }
@@ -296,12 +278,7 @@ static void mat_stream(float *y, const float *x, const Mat *w, int S) {
 
 /* prepara una Mat streamata: dims validate contro il file, nessun dato letto */
 static void mat_stream_init(Model *m, Mat *w, const char *name, int O, int I) {
-    int64_t have = st_numel(&m->S, name);
-    if (have != (int64_t)O*I) {
-        fprintf(stderr, "tensor %s: numel %lld != atteso %lld\n",
-                name, (long long)have, (long long)((int64_t)O*I));
-        exit(1);
-    }
+    st_expect(&m->S, name, (int64_t)O*I);
     w->f = NULL; w->q = NULL; w->qs = NULL; w->q4 = NULL; w->gs = 0;
     w->O = O; w->I = I;
     w->sh = &m->S; w->sname = strdup(name);
@@ -397,12 +374,7 @@ static void model_init_ex(Model *m, const char *snap, int qbits, int64_t budget_
         for (int j = 0; j < n; j++) {
             if (i < m->n_resident) load_mat(m, r[j].mat, r[j].name, r[j].O, r[j].I);
             else {
-                int64_t have = st_numel(&m->S, r[j].name);
-                if (have != (int64_t)r[j].O*r[j].I) {
-                    fprintf(stderr, "tensor %s: numel %lld != atteso %lld\n",
-                            r[j].name, (long long)have, (long long)((int64_t)r[j].O*r[j].I));
-                    exit(1);
-                }
+                st_expect(&m->S, r[j].name, (int64_t)r[j].O*r[j].I);
                 r[j].mat->f = NULL; r[j].mat->q = NULL; r[j].mat->qs = NULL;
                 r[j].mat->O = r[j].O; r[j].mat->I = r[j].I;
             }
@@ -476,10 +448,8 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
 }
 
 static int run_ref(Model *m, const char *refpath) {
-    FILE *f = fopen(refpath, "rb"); if(!f){perror(refpath);return 1;}
-    fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
-    char *buf=malloc(n+1); if(fread(buf,1,n,f)!=(size_t)n){} buf[n]=0; fclose(f);
-    jval *ref = json_parse(buf, NULL);
+    char *buf = slurp_file(refpath, NULL);
+    jval *ref = json_parse(buf);
     int np, nfull;
     int *prompt = read_int_array(ref,"prompt_ids",&np);
     int *full   = read_int_array(ref,"full_ids",&nfull);

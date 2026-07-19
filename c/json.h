@@ -15,7 +15,7 @@ typedef struct jval {
     jtype t;
     double num;            /* J_NUM */
     int    boolean;        /* J_BOOL */
-    char  *str;            /* J_STR (NUL-terminata, dentro l'arena) */
+    char  *str;            /* J_STR (NUL-terminata, malloc indipendente) */
     /* array: figli in [0..len); oggetto: chiavi[] e figli[] in parallelo */
     struct jval **kids;
     char        **keys;    /* solo per J_OBJ */
@@ -24,8 +24,6 @@ typedef struct jval {
 
 typedef struct {
     const char *s;
-    char       *arena;     /* buffer per le stringhe smontate */
-    size_t      acap, aoff;
     int         depth;     /* annidamento corrente: bound contro lo stack-overflow
                             * da JSON malevolo tipo [[[[...]]]] (discesa ricorsiva) */
 } jparser;
@@ -34,13 +32,27 @@ typedef struct {
  * ~3). 1024 e' larghissimo per input legittimi e ben sotto il limite di stack. */
 #define J_MAX_DEPTH 1024
 
-static char *j_dup(jparser *p, const char *b, int n) {
-    /* ogni stringa ha la sua allocazione: un'arena con realloc sposterebbe il
-     * buffer invalidando i puntatori gia' emessi (use-after-free). */
-    (void)p;
+/* ogni stringa ha la sua allocazione: un buffer condiviso con realloc
+ * sposterebbe la memoria invalidando i puntatori gia' emessi */
+static char *j_dup(const char *b, int n) {
     char *d = (char *)malloc(n + 1);
     memcpy(d, b, n); d[n] = 0;
     return d;
+}
+
+/* legge un file intero in un buffer NUL-terminato (malloc'd; il chiamante
+ * libera). Tutti i consumatori di JSON su file passano da qui. */
+static char *slurp_file(const char *path, long *out_n) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror(path); exit(1); }
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    char *b = (char *)malloc(n + 1);
+    if (!b || fread(b, 1, n, f) != (size_t)n) {
+        fprintf(stderr, "%s: lettura fallita\n", path); exit(1);
+    }
+    b[n] = 0; fclose(f);
+    if (out_n) *out_n = n;
+    return b;
 }
 
 static void j_ws(jparser *p) { while (*p->s && isspace((unsigned char)*p->s)) p->s++; }
@@ -55,7 +67,6 @@ static jval *j_parse_val(jparser *p);
 static char *j_parse_str_raw(jparser *p) {
     /* assume *p->s == '"' */
     p->s++;
-    const char *start = p->s;
     /* trova la fine gestendo gli escape, poi copia decodificando i casi base */
     char tmp[1 << 16]; int n = 0;
     #define J_PUT(ch) do{ if (n < (int)sizeof(tmp)-1) tmp[n++] = (char)(ch); }while(0)
@@ -88,8 +99,7 @@ static char *j_parse_str_raw(jparser *p) {
     }
     #undef J_PUT
     if (*p->s == '"') p->s++;
-    (void)start;
-    return j_dup(p, tmp, n);
+    return j_dup(tmp, n);
 }
 
 static jval *j_parse_val(jparser *p) {
@@ -143,11 +153,9 @@ static jval *j_parse_val(jparser *p) {
 }
 
 /* API */
-static jval *json_parse(const char *text, char **arena_out) {
-    jparser p = { text, NULL, 0, 0, 0 };
-    jval *v = j_parse_val(&p);
-    if (arena_out) *arena_out = p.arena; else free(p.arena);
-    return v;
+static jval *json_parse(const char *text) {
+    jparser p = { text, 0 };
+    return j_parse_val(&p);
 }
 
 /* libera ricorsivamente un albero jval: ogni stringa e ogni nodo hanno la

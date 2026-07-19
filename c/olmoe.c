@@ -53,7 +53,7 @@ static void load_cfg(Cfg *c, const char *snap) {
     FILE *f = fopen(path, "rb"); if(!f){perror(path);exit(1);}
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
     char *buf = malloc(n+1); if(fread(buf,1,n,f)!=(size_t)n){} buf[n]=0; fclose(f);
-    char *arena=NULL; jval *r = json_parse(buf, &arena);
+    jval *r = json_parse(buf);
     c->hidden    = (int)json_get(r,"hidden_size")->num;
     c->n_layers  = (int)json_get(r,"num_hidden_layers")->num;
     c->n_heads   = (int)json_get(r,"num_attention_heads")->num;
@@ -66,7 +66,7 @@ static void load_cfg(Cfg *c, const char *snap) {
     jval *th = json_get(r,"rope_theta");  c->theta = th ? (float)th->num : 10000.f;
     jval *ep = json_get(r,"rms_norm_eps"); c->eps   = ep ? (float)ep->num : 1e-5f;
     jval *nt = json_get(r,"norm_topk_prob"); c->norm_topk = (nt && nt->t==J_BOOL) ? nt->boolean : 0;
-    free(buf); free(arena);
+    json_free(r); free(buf);
 }
 
 static float *load_t(Model *m, const char *name) {
@@ -316,7 +316,7 @@ int main(int argc, char **argv) {
     FILE *f = fopen(refpath, "rb"); if(!f){perror(refpath);return 1;}
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
     char *buf=malloc(n+1); if(fread(buf,1,n,f)!=(size_t)n){} buf[n]=0; fclose(f);
-    char *arena=NULL; jval *ref = json_parse(buf, &arena);
+    jval *ref = json_parse(buf);
     int np, nfull; int *prompt = read_int_array(ref,"prompt_ids",&np); int *full = read_int_array(ref,"full_ids",&nfull);
     int n_new = nfull - np;
 
@@ -338,6 +338,6 @@ int main(int argc, char **argv) {
     printf("Expert cache hit rate: %.1f%%  (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
     printf("Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
-    free(buf); free(arena);
+    json_free(ref); free(buf);
     return 0;
 }

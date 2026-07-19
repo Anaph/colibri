@@ -28,8 +28,7 @@
 int ht_json(void) {
     jval *root = json_parse(
         "{\"name\":\"Colibri\\nCPU\",\"enabled\":true,\"empty\":null,"
-        "\"values\":[1,-2.5,3e2],\"unicode\":\"\\u03bb \\uD83D\\uDE80\"}",
-        NULL
+        "\"values\":[1,-2.5,3e2],\"unicode\":\"\\u03bb \\uD83D\\uDE80\"}"
     );
     CHECK(root && root->t == J_OBJ);
     CHECK(strcmp(json_get(root, "name")->str, "Colibri\nCPU") == 0);
@@ -52,7 +51,7 @@ int ht_json_free(void) {
         "{\"a\":{\"b\":[1,\"x\",{\"c\":null,\"d\":[true,false]}],\"e\":\"\"},"
         "\"f\":[],\"g\":{},\"h\":\"fine\"}";
     for (int rep = 0; rep < 3; rep++) {
-        jval *root = json_parse(doc, NULL);
+        jval *root = json_parse(doc);
         CHECK(root && root->t == J_OBJ && root->len == 4);
         CHECK(json_get(json_get(root,"a"),"b")->len == 3);
         CHECK(strcmp(json_get(root,"h")->str, "fine") == 0);

@@ -141,7 +141,7 @@ static void st_index_file(shards *S, const char *path) {
     if (pread(fd, hdr, hlen, 8) != (ssize_t)hlen) { perror("pread hdr"); exit(1); }
     hdr[hlen] = 0;
     int64_t data_start = 8 + (int64_t)hlen;
-    jval *root = json_parse(hdr, NULL);
+    jval *root = json_parse(hdr);
     if (!root || root->t != J_OBJ) {
         fprintf(stderr, "%s: safetensors header is not a JSON object\n", path); exit(1); }
     for (int i = 0; i < root->len; i++) {
@@ -233,6 +233,19 @@ static st_tensor *st_find(shards *S, const char *name) {
 }
 static int st_has(shards *S, const char *name) { return st_find(S, name) != NULL; }
 
+/* trova un tensore e ne valida il numel (expect<=0 = solo esistenza): l'UNICO
+ * punto che stampa il mismatch di forma — prima era open-coded in 5 posti. */
+static st_tensor *st_expect(shards *S, const char *name, int64_t expect) {
+    st_tensor *t = st_find(S, name);
+    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (expect > 0 && t->numel != expect) {
+        fprintf(stderr, "tensor %s: numel %lld != atteso %lld (layout diverso?)\n",
+                name, (long long)t->numel, (long long)expect);
+        exit(1);
+    }
+    return t;
+}
+
 /* prefetch ASINCRONO: dice al kernel di iniziare a leggere le pagine del tensore in
  * background (readahead). Serve a sovrapporre l'I/O degli expert col calcolo: si
  * prefetcha tutto il set di expert di un layer, poi le pread sincrone trovano la cache
@@ -240,33 +253,6 @@ static int st_has(shards *S, const char *name) { return st_find(S, name) != NULL
 static void st_prefetch(shards *S, const char *name) {
     st_tensor *t = st_find(S, name);
     if (t) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_WILLNEED);
-}
-
-/* legge un tensore in un buffer float32 fornito dal chiamante (numel float).
- * drop=1 -> consiglia al kernel di scartare le pagine (per gli expert in streaming). */
-static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
-    st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
-    void *raw = malloc(t->nbytes);
-    if (!raw) { fprintf(stderr, "malloc %lld bytes for tensor %s failed\n", (long long)t->nbytes, name); exit(1); }
-    if (pread(t->fd, raw, t->nbytes, t->off) != t->nbytes) { perror("pread data"); exit(1); }
-    if (t->dtype >= ST_DTYPE_QBLOCK) {
-        if (!g_st_dequant_fn) { fprintf(stderr, "tensor %s: dtype quantizzato senza dequant hook\n", name); exit(1); }
-        g_st_dequant_fn(t->dtype, raw, t->numel, out);
-        free(raw);
-        if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
-        return t->numel;
-    }
-    if (t->dtype == 2) {
-        memcpy(out, raw, t->nbytes);
-    } else if (t->dtype == 0) {
-        uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = bf16_to_f32(p[i]);
-    } else {
-        uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = f16_to_f32(p[i]);
-    }
-    free(raw);
-    if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
-    return t->numel;
 }
 
 static int64_t st_numel(shards *S, const char *name) {
@@ -323,6 +309,16 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }
     free(raw);
     if (drop) posix_fadvise(t->fd, boff, nb, POSIX_FADV_DONTNEED);
+}
+
+/* legge un tensore INTERO in un buffer float32 del chiamante: e' la fetta
+ * [0, numel) — una sola implementazione della conversione dtype. Nota: i
+ * tensori U8 (container pre-quantizzato) qui falliscono RUMOROSAMENTE come
+ * nella slice; prima venivano letti in silenzio come F16. */
+static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
+    st_tensor *t = st_expect(S, name, 0);
+    st_read_slice_f32(S, name, 0, t->numel, out, drop);
+    return t->numel;
 }
 
 #endif

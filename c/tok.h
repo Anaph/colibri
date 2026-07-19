@@ -102,18 +102,13 @@ static void tk_build_bytemap(Tok *T){
 }
 
 /* ---------- caricamento tokenizer.json ---------- */
-static char *tk_read_file(const char *path, long *out_n){
-    FILE *f=fopen(path,"rb"); if(!f){ perror(path); exit(1); }
-    fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
-    char *b=malloc(n+1); if(fread(b,1,n,f)!=(size_t)n){} b[n]=0; fclose(f); if(out_n)*out_n=n; return b;
-}
 static int cmp_sp_len(const void *a, const void *b){ return ((const Special*)b)->len - ((const Special*)a)->len; }
 
 static void tok_load(Tok *T, const char *path){
     memset(T,0,sizeof(*T));
     tk_build_bytemap(T);
-    long fn; char *buf=tk_read_file(path,&fn);
-    jval *root=json_parse(buf,NULL);
+    char *buf=slurp_file(path,NULL);
+    jval *root=json_parse(buf);
     jval *model=json_get(root,"model");
     jval *vocab=json_get(model,"vocab");
     jval *merges=json_get(model,"merges");

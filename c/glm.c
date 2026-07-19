@@ -1246,17 +1246,17 @@ static void rope_interleave(float *v, int pos, const Cfg *c){
 }
 
 /* ---------- config ---------- */
-static jval* cfg_root(const char *snap, char **arena){
+static jval* cfg_root(const char *snap){
     char p[2048]; snprintf(p,sizeof(p),"%s/config.json",snap);
     FILE *f=fopen(p,"rb"); if(!f){perror(p);exit(1);}
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
     char *b=malloc(n+1); size_t got=fread(b,1,n,f); b[got]=0; fclose(f);
     if((long)got!=n) fprintf(stderr,"warning: short read on %s (%ld of %ld)\n",p,(long)got,n);
-    return json_parse(b,arena);
+    return json_parse(b);
 }
 static int gi(jval*r,const char*k){ jval*v=json_get(r,k); return v?(int)v->num:0; }
 static void load_cfg(Cfg *c, const char *snap){
-    char *ar=NULL; jval *r=cfg_root(snap,&ar);
+    jval *r=cfg_root(snap);
     c->hidden=gi(r,"hidden_size"); c->n_layers=gi(r,"num_hidden_layers");
     c->n_heads=gi(r,"num_attention_heads"); c->n_experts=gi(r,"n_routed_experts");
     c->topk=gi(r,"num_experts_per_tok"); c->moe_inter=gi(r,"moe_intermediate_size");
@@ -1304,7 +1304,6 @@ static void load_cfg(Cfg *c, const char *snap){
     CKR("vocab_size",c->vocab,1,1<<24)           CKR("index_topk",c->index_topk,0,1<<20)
     CKR("index_n_heads",c->index_nh,0,1024)      CKR("index_head_dim",c->index_hd,0,1<<16)
     #undef CKR
-    free(ar);
 }
 
 /* Derive the fmt=4 group size from the scale-array byte count. A grouped-int4
@@ -4294,7 +4293,7 @@ static void run_score(Model *m, const char *snap, const char *path){
      * prefissato (eval_glm.py post-#194) passa INTATTO. SCORE_PREFIX=0 -> comportamento nudo. */
     int pfx[2]={-1,-1}, pfx_on=0;
     if(!getenv("SCORE_PREFIX")||atoi(getenv("SCORE_PREFIX"))){
-        char *ar=NULL; jval *r=cfg_root(snap,&ar);
+        jval *r=cfg_root(snap);
         jval *mt=json_get(r,"model_type");
         if(mt_is_glm(mt?mt->str:NULL)){
             char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
@@ -4304,7 +4303,6 @@ static void run_score(Model *m, const char *snap, const char *path){
                 fprintf(stderr,"[SCORE] GLM snapshot: prepending [gMASK]<sop> (ids %d,%d) to unprefixed requests — disable with SCORE_PREFIX=0\n",pfx[0],pfx[1]);
             } else fprintf(stderr,"[SCORE] GLM config but tokenizer has no [gMASK]/<sop>: prefix OFF\n");
         }
-        free(ar);
     }
     FILE *f=fopen(path,"rb"); if(!f){perror(path);exit(1);}
     int maxT=1; { char *ln=NULL; size_t cp=0;
@@ -6043,7 +6041,7 @@ int main(int argc, char **argv){
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
     char *b=malloc(n+1); size_t got=fread(b,1,n,f); b[got]=0; fclose(f);
     if((long)got!=n) fprintf(stderr,"warning: short read on %s (%ld of %ld)\n",refpath,(long)got,n);
-    char *ar=NULL; jval *ref=json_parse(b,&ar);
+    jval *ref=json_parse(b);
     int np=0,nfull=0; int *prompt=read_arr(ref,"prompt_ids",&np); int *full=read_arr(ref,"full_ids",&nfull);
     if(!prompt||!full||np<1||nfull<np){ fprintf(stderr,"ref file missing prompt_ids/full_ids or empty\n"); return 1; }
     int n_new=nfull-np;

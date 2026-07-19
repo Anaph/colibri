@@ -219,7 +219,7 @@ static void sgb_free_jval(jval *v){
  * frees) or NULL with a message in err (if err != NULL). */
 static char *schema_to_gbnf(const char *schema_json, char *err, int errsz){
     SgbCtx C; memset(&C, 0, sizeof C);
-    jval *sc = json_parse(schema_json, NULL);
+    jval *sc = json_parse(schema_json);
     if (!sc){ if (err) snprintf(err, errsz, "schema: json parse failed"); return NULL; }
 
     sgb_put(&C, "root ::= jws ");
