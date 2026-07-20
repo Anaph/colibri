@@ -1,0 +1,54 @@
+# Ambiente docker di colibri. I modelli vivono sull'host e si montano in
+# /models (default: ./models, override con MODELS_DIR=...).
+#
+#   docker compose build
+#   SNAP=/models/Qwen3-0.6B docker compose run --rm qwen            # chat
+#   SNAP=/models/Qwen3-0.6B PROMPT="ciao" docker compose run --rm qwen
+#   GGUF=/models/Qwen3-0.6B-Q4_K_M.gguf docker compose run --rm qwen
+#   SNAP=/models/gemma docker compose run --rm gemma
+#
+# Le variabili elencate sotto passano dall'host al container solo se
+# impostate (sintassi pass-through di compose).
+x-colibri: &colibri
+  image: colibri
+  build: .
+  stdin_open: true          # la chat interattiva legge da stdin
+  tty: true
+  volumes:
+    - ${MODELS_DIR:-./models}:/models:ro
+  environment:
+    - SNAP
+    - GGUF
+    - PROMPT
+    - REF
+    - NGEN
+    - CTX
+    - TEMP
+    - NUCLEUS
+    - SEED
+    - CHAT_TEMPLATE
+    - THINK
+    - QBITS
+    - QGROUP
+    - KV_BITS
+    - MEM_GB
+    - MEM_FRAC
+    - MICRO
+    - MICRO_DROP
+    - PREFILL_CHUNK
+    - THREADS
+    - TOKENS
+    - TTA
+    - LORA
+
+services:
+  qwen:
+    <<: *colibri
+
+  gemma:
+    <<: *colibri
+    entrypoint: ["/usr/local/bin/gemma"]
+
+  glm:
+    <<: *colibri
+    entrypoint: ["/usr/local/bin/glm"]

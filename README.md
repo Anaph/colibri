@@ -30,6 +30,39 @@ cmake ≥ 3.24 and a C++ compiler for the GoogleTest harness (test logic itself
 is plain C; the C++ is confined to thin gtest glue). The first configure
 downloads a pinned gtest via FetchContent unless a system GTest is installed.
 
+## Docker
+
+No toolchain on the host needed — the multi-stage `Dockerfile` builds the
+portable binaries and ships a slim runtime image (debian-slim + libgomp,
+all four engines in `/usr/local/bin`):
+
+```bash
+make docker                 # docker build -t colibri .
+make docker-test            # runs the full gtest suite INSIDE the build:
+                            # the image fails to build if a test fails
+
+# models live on the host, mounted read-only at /models
+SNAP=/models/Qwen3-0.6B make docker-run                  # interactive chat
+docker run --rm -it -v ~/models:/models:ro \
+  -e GGUF=/models/Qwen3-0.6B-Q4_K_M.gguf -e PROMPT="hi" colibri
+```
+
+Or with compose (services `qwen`, `gemma`, `glm`; the whole env-knob table
+passes through from the host):
+
+```bash
+docker compose build
+SNAP=/models/Qwen3-0.6B QBITS=8 docker compose run --rm qwen
+MODELS_DIR=/data/llm GGUF=/models/model.gguf docker compose run --rm qwen
+```
+
+The image builds `make portable` (x86-64-v3 on amd64, armv8-a on arm64), so
+it runs on any modern host of the same architecture; rebuild with
+`--build-arg ARCH=native` for the fastest binaries on one specific machine,
+and `--build-arg BASE=<mirror>/debian:bookworm-slim` behind a registry
+mirror. A hard RAM cap composes naturally with the engine's own knobs:
+`docker run -m 256m -e MICRO=1 ...`.
+
 ## SIMD
 
 The shared kernels in `c/simd.h` are selected at compile time by `-march`
@@ -238,9 +271,12 @@ c/gemma.c    Gemma 4 engine (text-only)
 c/nn.h       shared kernels: matmul f32/int8, quantization, sampler
 c/st.h       safetensors loader (multi-shard, BF16/F16/F32)
 c/tok.h      BPE tokenizer: byte-level and SentencePiece modes
+c/gguf.h     GGUF reader (single-file models, Q4_0..Q6_K)
 c/json.h     minimal JSON parser
 c/compat.h   cross-platform shims
 c/tests/     test suite: C logic + GoogleTest glue (make test)
+Dockerfile   multi-stage image: build -> (test) -> slim runtime
+docker-compose.yml  services qwen/gemma/glm with /models mounted
 ```
 
 ### Gemma engine notes

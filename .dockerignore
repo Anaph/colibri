@@ -1,0 +1,12 @@
+# contesto di build minimo: sorgenti + Makefile, niente artefatti locali
+.git
+c/tests/build
+c/tests/build-native
+c/glm
+c/olmoe
+c/qwen
+c/gemma
+c/*.exe
+models
+*.safetensors
+*.gguf
